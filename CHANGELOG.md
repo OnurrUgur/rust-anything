@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- When `build` of a Ruby bridge fails with rb-sys's `Stable API is needed but could not find a
+  candidate` and the Ruby rb-sys used (`RUBY`, else `ruby`) is older than `doctor`'s 3.0, the
+  error now ends with that Ruby's version and `doctor`'s install command (macOS's system Ruby is
+  2.6), instead of only rb-sys's hint to enable `stable-api-compiled-fallback`.
+
 ## 3.0.0 (2026-11-21)
 
 - `package` makes a whole Node CLI installable: pointed at a front door (`rust/app`), it lays out

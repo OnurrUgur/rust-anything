@@ -161,7 +161,7 @@ pub fn bench(crate_dir: &Path, m: &Manifest, min_ms: u64) -> Result<Vec<BenchRow
 
 /// Builds the extension and puts it beside the wrapper as `ruby/<lib>_native.so`.
 pub fn build(crate_dir: &Path, m: &Manifest) -> Result<PathBuf> {
-    let lib = crate::harness_c::build(crate_dir, m)?;
+    let lib = crate::harness_c::build(crate_dir, m).map_err(explain_old_ruby)?;
     let ext = if cfg!(target_os = "macos") {
         "bundle"
     } else {
@@ -171,4 +171,94 @@ pub fn build(crate_dir: &Path, m: &Manifest) -> Result<PathBuf> {
     std::fs::create_dir_all(crate_dir.join("ruby"))?;
     std::fs::copy(&lib, &target)?;
     Ok(target)
+}
+
+/// rb-sys's error for a Ruby it has no stable API for: older than it supports, or newer.
+const NO_STABLE_API: &str = "Stable API is needed but could not find a candidate";
+
+/// rb-sys answers a Ruby it has no stable API for with a hint about its own features. When the
+/// Ruby it built against (`RUBY`, else `ruby`) is older than `doctor`'s minimum, this adds that
+/// cause and doctor's fix. Only a failed build gets it, so a Ruby chosen through `RUBY` or a
+/// version manager never stops a build that would work.
+fn explain_old_ruby(err: anyhow::Error) -> anyhow::Error {
+    if !err.to_string().contains(NO_STABLE_API) {
+        return err;
+    }
+    let mut cmd = Command::new(std::env::var_os("RUBY").unwrap_or_else(|| "ruby".into()));
+    cmd.arg("--version");
+    // Not the caller's folder: rb-sys runs Ruby from its own, where a version manager's
+    // `.ruby-version` of the project does not apply.
+    let Ok(_scratch) = crate::harness::scratch_cwd(&mut cmd) else {
+        return err;
+    };
+    let banner = crate::process::output(&mut cmd, crate::process::QUICK)
+        .ok()
+        .filter(|out| out.success())
+        .map(|out| out.stdout_text());
+    old_ruby_note(err, banner.as_deref())
+}
+
+/// `err` with the cause and doctor's fix when `banner` (`ruby --version`) is below the minimum.
+fn old_ruby_note(err: anyhow::Error, banner: Option<&str>) -> anyhow::Error {
+    let (Some(banner), Some(min)) = (banner.map(str::trim), crate::doctor::minimum("ruby")) else {
+        return err;
+    };
+    if !crate::doctor::parse_version(banner).is_some_and(|v| v < min) {
+        return err;
+    }
+    let system = if cfg!(target_os = "macos") {
+        " (macOS's system Ruby is 2.6)"
+    } else {
+        ""
+    };
+    let fix = crate::doctor::install_command("ruby")
+        .map(|fix| format!("\nfix: {fix}"))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "{err}\n\n{banner}: rust-anything needs Ruby {}.{}+{system}{fix}",
+        min.0,
+        min.1
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed() -> anyhow::Error {
+        anyhow::anyhow!(
+            "cargo build failed (exit status: 101):\n  Failed to setup stable API: {NO_STABLE_API}. \
+             Try enabling the `stable-api-compiled-fallback` feature in rb-sys."
+        )
+    }
+
+    #[test]
+    fn a_ruby_below_the_minimum_gets_the_cause_and_the_fix() {
+        let banner = "ruby 2.6.10p210 (2022-04-12 revision 67958) [universal.arm64e-darwin26]";
+        let explained = old_ruby_note(failed(), Some(banner)).to_string();
+        assert!(explained.starts_with("cargo build failed"), "{explained}");
+        assert!(
+            explained.contains(&format!("\n\n{banner}: rust-anything needs Ruby 3.0+")),
+            "{explained}"
+        );
+        let fix = crate::doctor::install_command("ruby").unwrap();
+        assert!(explained.ends_with(&format!("\nfix: {fix}")), "{explained}");
+    }
+
+    #[test]
+    fn a_newer_or_unknown_ruby_keeps_rb_sys_error() {
+        let plain = failed().to_string();
+        let newer = "ruby 4.1.0preview1 (2026-12-25 master 0123456789) +PRISM [arm64-darwin25]";
+        assert_eq!(old_ruby_note(failed(), Some(newer)).to_string(), plain);
+        assert_eq!(old_ruby_note(failed(), None).to_string(), plain);
+    }
+
+    #[test]
+    fn other_build_failures_are_left_alone() {
+        let failed = anyhow::anyhow!("cargo build failed (exit status: 101):\nerror[E0308]");
+        assert_eq!(
+            explain_old_ruby(failed).to_string(),
+            "cargo build failed (exit status: 101):\nerror[E0308]"
+        );
+    }
 }
