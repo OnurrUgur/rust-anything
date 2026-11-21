@@ -194,7 +194,7 @@ fn explain_old_ruby(err: anyhow::Error) -> anyhow::Error {
         .ok()
         .filter(|out| out.success())
         .map(|out| out.stdout_text());
-    old_ruby_note(err, banner.as_deref())
+    old_ruby_note(err, banner.as_deref(), std::env::var_os("RUBY").is_some())
 }
 
 /// `ruby --version` for the Ruby rb-sys asks: `RUBY`, else `ruby`, without `RUBYOPT` as rb-sys
@@ -206,7 +206,8 @@ fn version_probe() -> Command {
 }
 
 /// `err` with the cause and doctor's fix when `banner` (`ruby --version`) is below the minimum.
-fn old_ruby_note(err: anyhow::Error, banner: Option<&str>) -> anyhow::Error {
+/// When `RUBY` chose that Ruby, installing another is not enough: `RUBY` has to change too.
+fn old_ruby_note(err: anyhow::Error, banner: Option<&str>, ruby_var: bool) -> anyhow::Error {
     let (Some(banner), Some(min)) = (banner.map(str::trim), crate::doctor::minimum("ruby")) else {
         return err;
     };
@@ -221,8 +222,13 @@ fn old_ruby_note(err: anyhow::Error, banner: Option<&str>) -> anyhow::Error {
     let fix = crate::doctor::install_command("ruby")
         .map(|fix| format!("\nfix: {fix}"))
         .unwrap_or_default();
+    let ruby_var = if ruby_var {
+        "\n`RUBY` is set, and rb-sys uses it before `ruby` on PATH: point it at the new Ruby, or unset it"
+    } else {
+        ""
+    };
     anyhow::anyhow!(
-        "{err}\n\n{banner}: rust-anything needs Ruby {}.{}+{system}{fix}",
+        "{err}\n\n{banner}: rust-anything needs Ruby {}.{}+{system}{fix}{ruby_var}",
         min.0,
         min.1
     )
@@ -242,7 +248,7 @@ mod tests {
     #[test]
     fn a_ruby_below_the_minimum_gets_the_cause_and_the_fix() {
         let banner = "ruby 2.6.10p210 (2022-04-12 revision 67958) [universal.arm64e-darwin26]";
-        let explained = old_ruby_note(failed(), Some(banner)).to_string();
+        let explained = old_ruby_note(failed(), Some(banner), false).to_string();
         assert!(explained.starts_with("cargo build failed"), "{explained}");
         assert!(
             explained.contains(&format!("\n\n{banner}: rust-anything needs Ruby 3.0+")),
@@ -256,8 +262,25 @@ mod tests {
     fn a_newer_or_unknown_ruby_keeps_rb_sys_error() {
         let plain = failed().to_string();
         let newer = "ruby 4.1.0preview1 (2026-12-25 master 0123456789) +PRISM [arm64-darwin25]";
-        assert_eq!(old_ruby_note(failed(), Some(newer)).to_string(), plain);
-        assert_eq!(old_ruby_note(failed(), None).to_string(), plain);
+        assert_eq!(
+            old_ruby_note(failed(), Some(newer), false).to_string(),
+            plain
+        );
+        assert_eq!(old_ruby_note(failed(), None, true).to_string(), plain);
+    }
+
+    #[test]
+    fn a_ruby_chosen_through_ruby_var_says_to_change_it() {
+        let banner = "ruby 2.6.10p210 (2022-04-12 revision 67958) [universal.arm64e-darwin26]";
+        let explained = old_ruby_note(failed(), Some(banner), true).to_string();
+        let fix = crate::doctor::install_command("ruby").unwrap();
+        assert!(
+            explained.ends_with(&format!(
+                "\nfix: {fix}\n`RUBY` is set, and rb-sys uses it before `ruby` on PATH: \
+                 point it at the new Ruby, or unset it"
+            )),
+            "{explained}"
+        );
     }
 
     #[test]
