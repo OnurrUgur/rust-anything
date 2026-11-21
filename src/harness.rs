@@ -110,7 +110,8 @@ pub struct RecordOptions<'a> {
     pub crate_dir: &'a Path,
     /// Generated cases per function.
     pub count: usize,
-    /// Extra cases, one `{"fn": name, "args": [...]}` JSON object per line.
+    /// Extra cases, one `{"fn": name, "args": [...]}` JSON object per line, with `"kwargs": {...}`
+    /// for Python and Ruby arguments passed by keyword.
     pub inputs: Option<&'a Path>,
     /// Import the original from this JS module instead of the TS source files.
     pub module: Option<&'a Path>,

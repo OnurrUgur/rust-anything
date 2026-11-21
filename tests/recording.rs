@@ -133,6 +133,56 @@ fn records_the_calls_a_python_test_suite_makes() {
 }
 
 #[test]
+fn records_python_test_calls_that_pass_arguments_by_keyword() {
+    if !common::have("python3") {
+        return;
+    }
+    let root = project(
+        "py-kw",
+        &[
+            (
+                "pyproject.toml",
+                "[project]\nname = \"shape\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "shape.py",
+                "def scale(n: float, *, by: float = 2.0) -> float:\n    return n * by\n\n\n\
+                 def pad(s: str, width: int = 4, fill: str = ' ') -> str:\n    return s.ljust(width, fill)\n",
+            ),
+            (
+                "test_shape.py",
+                "import unittest\nfrom shape import pad, scale\n\n\
+                 class T(unittest.TestCase):\n    def test_it(self):\n        \
+                 self.assertEqual(scale(3), 6)\n        self.assertEqual(scale(3, by=10), 30)\n        \
+                 self.assertEqual(pad('a', fill='*'), 'a***')\n",
+            ),
+        ],
+    );
+    let (printed, inputs) = from_tests(&root, "shape.py", &["python3", "-m", "unittest"]);
+    let cases = std::fs::read_to_string(root.join("port").join("cases.jsonl")).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    // The original ran with the keyword arguments when the cases were recorded.
+    assert!(
+        cases.contains(r#""args": [3], "kwargs": {"by": 10}, "ok": 30"#),
+        "{cases}"
+    );
+    assert!(
+        cases.contains(r#""args": ["a"], "kwargs": {"fill": "*"}, "ok": "a***""#),
+        "{cases}"
+    );
+    // A keyword-only argument, and one passed by name after a skipped default.
+    assert!(printed.contains("Captured 3 call(s)"), "{printed}");
+    assert!(
+        inputs.contains(r#"{"fn": "scale", "args": [3], "kwargs": {"by": 10}}"#),
+        "{inputs}"
+    );
+    assert!(
+        inputs.contains(r#"{"fn": "pad", "args": ["a"], "kwargs": {"fill": "*"}}"#),
+        "{inputs}"
+    );
+}
+
+#[test]
 fn records_the_calls_a_js_test_suite_makes_and_restores_the_source() {
     if !common::have("node") {
         return;

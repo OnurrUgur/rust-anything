@@ -118,7 +118,8 @@ enum Cmd {
         /// Generated cases per function.
         #[arg(long, default_value_t = 200)]
         count: usize,
-        /// Extra cases: JSONL of `{"fn": name, "args": [...]}`.
+        /// Extra cases: JSONL of `{"fn": name, "args": [...]}`, plus `"kwargs": {...}` for Python
+        /// and Ruby arguments passed by keyword.
         #[arg(long)]
         inputs: Option<PathBuf>,
         /// Import the original from this JS module (e.g. built output) instead of the TS source.

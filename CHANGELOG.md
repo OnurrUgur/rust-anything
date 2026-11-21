@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Python `record --from-tests` keeps the calls that pass arguments by keyword where Python does
+  not bind them by position: keyword-only parameters (`def f(x, *, flag)`) and an argument named
+  after a skipped default (`f(x, fill='*')`). They were dropped from `test-inputs.jsonl`; they
+  are now written with a `kwargs` object, which the driver already replays.
+
 ## 3.1.0 (2026-11-22)
 
 - `go` runs `bench` after gate and switches a unit on only when it is not slower as its callers

@@ -26,7 +26,8 @@ const BACKUP: &str = ".rust-anything-backup";
 
 #[derive(Debug)]
 pub struct Capture {
-    /// The captured inputs, one `{"fn", "args"}` per line, in the `--inputs` format.
+    /// The captured inputs, one `{"fn", "args"}` per line (with `"kwargs"` for Python arguments
+    /// passed by keyword), in the `--inputs` format.
     pub inputs: PathBuf,
     pub per_function: BTreeMap<String, usize>,
     /// Exports the capture cannot see (not a function declaration), with why.
@@ -292,11 +293,14 @@ def _wrap(name, orig):
         if n < 5000 and sig is not None:
             try:
                 bound = sig.bind(*args, **kwargs)
-                if not bound.kwargs:
-                    line = json.dumps({"fn": name, "args": enc(list(bound.args))}, ensure_ascii=False, allow_nan=False)
-                    with open(_OUT, "a", encoding="utf-8") as f:
-                        f.write(line + "\n")
-                    _COUNT[name] = n + 1
+                case = {"fn": name, "args": enc(list(bound.args))}
+                # Keyword-only arguments, and those named after a skipped default.
+                if bound.kwargs:
+                    case["kwargs"] = {k: enc(v) for k, v in bound.kwargs.items()}
+                line = json.dumps(case, ensure_ascii=False, allow_nan=False)
+                with open(_OUT, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                _COUNT[name] = n + 1
             except Exception:
                 pass
         return orig(*args, **kwargs)
