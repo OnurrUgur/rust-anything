@@ -6,6 +6,11 @@
   not bind them by position: keyword-only parameters (`def f(x, *, flag)`) and an argument named
   after a skipped default (`f(x, fill='*')`). They were dropped from `test-inputs.jsonl`; they
   are now written with a `kwargs` object, which the driver already replays.
+- Python `diff` and `bench` pass keyword arguments to the Rust bindings under the bindings'
+  snake_case names (`scaleBy=10` as `scale_by=10`); a keyword-only parameter named in camelCase
+  failed every case with `TypeError: unexpected keyword argument`. A Python mismatch shows its
+  keyword arguments after the positional ones, as Ruby's does, so a `known-diffs.jsonl` entry
+  for `f(x)` no longer explains `f(x, flag=True)`.
 
 ## 3.1.0 (2026-11-22)
 
