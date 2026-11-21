@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- JS/TS `record --from-tests` encodes the captured arguments with the codec `record` and `diff`
+  use, instead of a copy of it that had fallen behind. A `Buffer` was captured as a `Uint8Array`
+  (so `b.toString('hex')` recorded `"104,105"`), a `Float64Array` or other typed array as an
+  object with numeric keys, and an object shaped like a marker (`{ $date: 'x' }`) was replayed as
+  a `Date`. A call is now left out, as one that passes a function or a cycle already was, when an
+  argument is a RegExp, an Error, a `URL`, an `ArrayBuffer`, a boxed primitive or an object with
+  `toJSON`: those were captured as `{}`, their own fields or their `toJSON` result, which replay
+  passed as a different value. A class instance is still captured as its own fields.
+
 ## 3.1.0 (2026-11-22)
 
 - `go` runs `bench` after gate and switches a unit on only when it is not slower as its callers

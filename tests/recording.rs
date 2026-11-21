@@ -171,6 +171,78 @@ fn records_the_calls_a_js_test_suite_makes_and_restores_the_source() {
 }
 
 #[test]
+fn js_test_calls_are_captured_with_the_codec_record_uses() {
+    if !common::have("node") {
+        return;
+    }
+    let root = project(
+        "ts-codec",
+        &[
+            (
+                "package.json",
+                r#"{"name":"bin","version":"0.1.0","type":"module"}"#,
+            ),
+            (
+                "src/bin.ts",
+                "export function hex(b: Buffer): string {\n  return b.toString('hex')\n}\n\n\
+                 export function total(xs: Float64Array): number {\n  let s = 0\n  for (const x of xs) s += x\n  return s\n}\n\n\
+                 export function tag(o: { $date: string }): string {\n  return typeof o.$date\n}\n\n\
+                 export function hole(xs: (number | undefined)[]): boolean {\n  return xs[1] === undefined\n}\n\n\
+                 export function enc(s: string): string {\n  return s + '!'\n}\n\n\
+                 export function looksLikeMarker(s: string): string {\n  return s + '?'\n}\n\n\
+                 export function kind(v: unknown): string {\n  return Object.prototype.toString.call(v)\n}\n\n\
+                 export function Buffer(s: string): string {\n  return s + '#'\n}\n",
+            ),
+            (
+                "test.ts",
+                "import { hex, total, tag, hole, enc, looksLikeMarker, kind, Buffer as B } from './src/bin.ts'\n\
+                 class Sub extends Float64Array {}\n\
+                 class Tagged extends Float64Array { get [Symbol.toStringTag]() { return 'Tagged' } }\n\
+                 class T { a = 1; toJSON() { return 1 } }\n\
+                 const cyclic: any = {}\ncyclic.self = cyclic\n\
+                 if (hex(Buffer.from('hi')) !== '6869') process.exit(1)\n\
+                 if (total(new Float64Array([1.5, 2])) !== 3.5) process.exit(1)\n\
+                 if (total(new Sub([1, 2])) !== 3 || total(new Tagged([2, 2])) !== 4) process.exit(1)\n\
+                 if (B('c') !== 'c#') process.exit(1)\n\
+                 if (tag({ $date: 'x' }) !== 'string') process.exit(1)\n\
+                 if (!hole([1, , 3])) process.exit(1)\n\
+                 if (enc('a') !== 'a!' || looksLikeMarker('b') !== 'b?') process.exit(1)\n\
+                 for (const v of [() => 1, Symbol('s'), cyclic, /a/, new Error('e'), { r: /a/ },\n\
+                   new URL('https://example.com/'), new ArrayBuffer(2), new String('s'), new T()]) kind(v)\n\
+                 if (kind([0]) !== '[object Array]') process.exit(1)\n",
+            ),
+        ],
+    );
+    let (printed, inputs) = from_tests(&root, "src/bin.ts", &["node", "test.ts"]);
+    let cases = std::fs::read_to_string(root.join("port").join("cases.jsonl")).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    // Values `dec` cannot give back (a function, symbol, cycle, RegExp, Error, URL, ArrayBuffer,
+    // boxed string, or anything with `toJSON`, also nested) leave their call out; functions of
+    // the unit named like the codec's `enc` and `looksLikeMarker` are still wrapped, and one
+    // named `Buffer` does not stop the codec from telling a `Buffer`.
+    assert!(
+        printed.contains("Captured 10 call(s)"),
+        "{printed}\n{inputs}"
+    );
+    assert_eq!(inputs.matches(r#"{"fn":"kind""#).count(), 1, "{inputs}");
+    // Replayed through `dec`, each captured input gives the original what the test passed.
+    for line in [
+        r#"{"fn":"hex","args":[{"$buffer":[104,105]}],"ok":"6869"}"#,
+        r#"{"fn":"total","args":[{"$typed":{"kind":"Float64Array","values":[1.5,2]}}],"ok":3.5}"#,
+        r#"{"fn":"total","args":[{"$typed":{"kind":"Float64Array","values":[1,2]}}],"ok":3}"#,
+        r#"{"fn":"total","args":[{"$typed":{"kind":"Float64Array","values":[2,2]}}],"ok":4}"#,
+        r#"{"fn":"Buffer","args":["c"],"ok":"c#"}"#,
+        r#"{"fn":"tag","args":[{"$object":{"$date":"x"}}],"ok":"string"}"#,
+        r#"{"fn":"hole","args":[[1,{"$undefined":true},3]],"ok":true}"#,
+        r#"{"fn":"enc","args":["a"],"ok":"a!"}"#,
+        r#"{"fn":"looksLikeMarker","args":["b"],"ok":"b?"}"#,
+        r#"{"fn":"kind","args":[[0]],"ok":"[object Array]"}"#,
+    ] {
+        assert!(cases.contains(line), "{line}\n{cases}");
+    }
+}
+
+#[test]
 fn record_reports_lines_of_the_original_no_case_reached() {
     if !common::have("node") {
         return;
