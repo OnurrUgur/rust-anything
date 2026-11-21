@@ -184,8 +184,7 @@ fn explain_old_ruby(err: anyhow::Error) -> anyhow::Error {
     if !err.to_string().contains(NO_STABLE_API) {
         return err;
     }
-    let mut cmd = Command::new(std::env::var_os("RUBY").unwrap_or_else(|| "ruby".into()));
-    cmd.arg("--version");
+    let mut cmd = version_probe();
     // Not the caller's folder: rb-sys runs Ruby from its own, where a version manager's
     // `.ruby-version` of the project does not apply.
     let Ok(_scratch) = crate::harness::scratch_cwd(&mut cmd) else {
@@ -196,6 +195,14 @@ fn explain_old_ruby(err: anyhow::Error) -> anyhow::Error {
         .filter(|out| out.success())
         .map(|out| out.stdout_text());
     old_ruby_note(err, banner.as_deref())
+}
+
+/// `ruby --version` for the Ruby rb-sys asks: `RUBY`, else `ruby`, without `RUBYOPT` as rb-sys
+/// runs it (an option the old Ruby rejects would make it fail before printing its version).
+fn version_probe() -> Command {
+    let mut cmd = Command::new(std::env::var_os("RUBY").unwrap_or_else(|| "ruby".into()));
+    cmd.arg("--version").env_remove("RUBYOPT");
+    cmd
 }
 
 /// `err` with the cause and doctor's fix when `banner` (`ruby --version`) is below the minimum.
@@ -251,6 +258,18 @@ mod tests {
         let newer = "ruby 4.1.0preview1 (2026-12-25 master 0123456789) +PRISM [arm64-darwin25]";
         assert_eq!(old_ruby_note(failed(), Some(newer)).to_string(), plain);
         assert_eq!(old_ruby_note(failed(), None).to_string(), plain);
+    }
+
+    #[test]
+    fn the_version_probe_drops_rubyopt_as_rb_sys_does() {
+        let probe = version_probe();
+        assert_eq!(probe.get_args().collect::<Vec<_>>(), ["--version"]);
+        assert!(
+            probe
+                .get_envs()
+                .any(|(key, value)| key == "RUBYOPT" && value.is_none()),
+            "{probe:?}"
+        );
     }
 
     #[test]
