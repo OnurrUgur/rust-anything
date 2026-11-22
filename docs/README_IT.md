@@ -233,6 +233,7 @@ rust-anything bridge . src/fuzzy.ts --batch fuzzyScore:text
 # scrivi src/port.rs (o lascia fare al tuo agente), poi:
 rust-anything record rust/fuzzy-rs && rust-anything build rust/fuzzy-rs
 rust-anything diff rust/fuzzy-rs                       # ogni caso registrato deve coincidere
+rust-anything fuzz rust/fuzzy-rs --time 60 --keep      # input nuovi: ciò che la registrazione non copre
 rust-anything bench rust/fuzzy-rs                      # più veloce? lo dice il verdetto
 rust-anything gate rust/fuzzy-rs                       # finito significa che questo passa
 ```

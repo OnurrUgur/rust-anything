@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Python `record --from-tests` keeps the calls that pass arguments by keyword where Python does
+  not bind them by position: keyword-only parameters (`def f(x, *, flag)`) and an argument named
+  after a skipped default (`f(x, fill='*')`). They were dropped from `test-inputs.jsonl`; they
+  are now written with a `kwargs` object, which the driver already replays.
+- Python `diff` and `bench` pass keyword arguments to the Rust bindings under the bindings'
+  snake_case names (`scaleBy=10` as `scale_by=10`); a keyword-only parameter named in camelCase
+  failed every case with `TypeError: unexpected keyword argument`. A Python mismatch shows its
+  keyword arguments after the positional ones, as Ruby's does, so a `known-diffs.jsonl` entry
+  for `f(x)` no longer explains `f(x, flag=True)`.
+- JS/TS `record --from-tests` encodes the captured arguments with the codec `record` and `diff`
+  use, instead of a copy of it that had fallen behind. A `Buffer` was captured as a `Uint8Array`
+  (so `b.toString('hex')` recorded `"104,105"`), a `Float64Array` or other typed array as an
+  object with numeric keys, and an object shaped like a marker (`{ $date: 'x' }`) was replayed as
+  a `Date`. A call is now left out, as one that passes a function or a cycle already was, when an
+  argument is a RegExp, an Error, a `URL`, an `ArrayBuffer`, a boxed primitive or an object with
+  `toJSON`: those were captured as `{}`, their own fields or their `toJSON` result, which replay
+  passed as a different value. A class instance is still captured as its own fields.
 - `analyze` judges each export with the same functions `bridge` uses. It had its own copy of
   the rules and put units in `start_here` that `bridge` then refused ("every export ... must
   stay in TypeScript/JavaScript"). The copy missed three of them: a JS unit's sibling `.d.ts` (a
