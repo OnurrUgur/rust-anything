@@ -894,3 +894,69 @@ fn map_names_a_path_that_does_not_exist() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("/no/such/rust-anything-path"), "{err}");
 }
+
+#[test]
+fn bridgeable_exports_are_counted_as_bridge_judges_them() {
+    let root = std::env::temp_dir().join(format!("ra-analyze-dts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let write = |path: &str, text: &str| std::fs::write(root.join(path), text).unwrap();
+    write(
+        "package.json",
+        r#"{"name":"t","version":"1.0.0","type":"module"}"#,
+    );
+    write(
+        "src/plug.js",
+        "export function use(plugin) { return plugin(1); }\n",
+    );
+    write(
+        "src/plug.d.ts",
+        "export declare function use(plugin: (x: number) => number): number;\n",
+    );
+    write(
+        "src/sum.js",
+        "export function sum(a, b) { return a + b; }\n",
+    );
+    write(
+        "src/sum.d.ts",
+        "export declare function sum(a: number, b: number): number;\n",
+    );
+    write(
+        "src/bus.ts",
+        "export class Bus {\n  on(h: (x: number) => void): void { h(1); }\n}\n",
+    );
+    write(
+        "src/pat.ts",
+        "type Pat = RegExp;\nexport function test(p: Pat, s: string): boolean { return p.test(s); }\n",
+    );
+    let report = analyze(&root).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    for (id, why) in [
+        (
+            "src/bus.ts",
+            "`bridge` keeps a class with a callback method in JS",
+        ),
+        (
+            "src/pat.ts",
+            "`bridge` resolves `Pat` to RegExp and keeps `test` in JS",
+        ),
+    ] {
+        let u = unit(&report, id);
+        assert_eq!((u.exports, u.bridgeable), (1, 0), "{why}: {u:?}");
+        assert_eq!(u.status, Status::Caution, "{u:?}");
+    }
+    let plug = unit(&report, "src/plug.js");
+    assert_eq!(
+        (plug.exports, plug.bridgeable),
+        (1, 0),
+        "`bridge` reads plug.d.ts and keeps `use` in JS: {plug:?}"
+    );
+    assert_eq!(plug.status, Status::Caution, "{plug:?}");
+    assert!(
+        report.start_here == ["src/sum.js"],
+        "{:?}",
+        report.start_here
+    );
+    let sum = unit(&report, "src/sum.js");
+    assert_eq!((sum.exports, sum.bridgeable), (1, 1), "{sum:?}");
+}

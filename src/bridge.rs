@@ -127,6 +127,41 @@ fn has_functions(name: &str, local_types: &[LocalType], seen: &mut Vec<String>) 
         .any(|w| has_functions(w, local_types, seen))
 }
 
+/// The exported functions of a TS/JS `file` with the types `bridge` judges them by: a sibling
+/// `.d.ts` applied, aliases resolved and generic constraints substituted. `analyze` counts
+/// bridgeable exports from the same list.
+pub fn ts_functions(root: &Path, file: &str, text: &str, types: &[LocalType]) -> Vec<ExportedFn> {
+    let mut functions = exported_functions(file, text);
+    crate::ts::jsdoc::apply_declarations(root, file, &mut functions);
+    for f in &mut functions {
+        for p in &mut f.params {
+            p.ts_type = resolve_aliases(&p.ts_type, types);
+        }
+        f.returns = resolve_aliases(&f.returns, types);
+        substitute_constraints(f, types);
+    }
+    functions
+}
+
+/// Why a class has to stay in the source language: its blocker, else the first method (and, for
+/// TS/JS, the constructor) that cannot cross. `None` when it can be bridged.
+pub fn class_reason(class: &ExportedClass, types: &[LocalType], ts: bool) -> Option<String> {
+    let constructor = ts.then(|| ExportedFn {
+        name: format!("{} constructor", class.name),
+        file: class.file.clone(),
+        line: class.line,
+        params: class.constructor.clone(),
+        returns: "void".into(),
+        ..Default::default()
+    });
+    class.blocker.clone().or_else(|| {
+        constructor
+            .iter()
+            .chain(&class.methods)
+            .find_map(|m| js_only_reason(m, types).map(|r| format!("`{}`: {r}", m.name)))
+    })
+}
+
 /// Why an export cannot cross a JS/Rust bridge unchanged, if it cannot.
 ///
 /// Functions, iterators, RegExp objects and objects with function members are JS values a
@@ -1091,13 +1126,8 @@ pub fn bridge(opts: &Options) -> Result<Outcome> {
                 }
             }
             for class in foreign_classes {
-                let method_reason = class
-                    .methods
-                    .iter()
-                    .find_map(|m| js_only_reason(m, &[]).map(|r| format!("`{}`: {r}", m.name)));
                 match keep_reason(&opts.keep, &class.name)
-                    .or_else(|| class.blocker.clone())
-                    .or(method_reason)
+                    .or_else(|| class_reason(&class, &[], false))
                 {
                     Some(reason) => js_only.push(JsOnly {
                         name: class.name,
@@ -1113,22 +1143,7 @@ pub fn bridge(opts: &Options) -> Result<Outcome> {
         let types = types_in_scope(&root, file, &text);
         for mut class in exported_classes(file, &text) {
             let kept = keep_reason(&opts.keep, &class.name);
-            let constructor = ExportedFn {
-                name: format!("{} constructor", class.name),
-                file: class.file.clone(),
-                line: class.line,
-                params: class.constructor.clone(),
-                returns: "void".into(),
-                is_async: false,
-                is_generator: false,
-                type_params: Vec::new(),
-                uses_instanceof: false,
-                ..Default::default()
-            };
-            let method_reason = std::iter::once(&constructor)
-                .chain(&class.methods)
-                .find_map(|m| js_only_reason(m, &types).map(|r| format!("`{}`: {r}", m.name)));
-            match kept.or_else(|| class.blocker.clone()).or(method_reason) {
+            match kept.or_else(|| class_reason(&class, &types, true)) {
                 Some(reason) => js_only.push(JsOnly {
                     name: class.name,
                     file: class.file,
@@ -1149,14 +1164,7 @@ pub fn bridge(opts: &Options) -> Result<Outcome> {
                 }
             }
         }
-        let mut functions = exported_functions(file, &text);
-        crate::ts::jsdoc::apply_declarations(&root, file, &mut functions);
-        for mut f in functions {
-            for p in &mut f.params {
-                p.ts_type = resolve_aliases(&p.ts_type, &types);
-            }
-            f.returns = resolve_aliases(&f.returns, &types);
-            substitute_constraints(&mut f, &types);
+        for mut f in ts_functions(&root, file, &text, &types) {
             substitute_json(&mut f, &opts.as_json);
             let kept = keep_reason(&opts.keep, &f.name);
             match kept.or_else(|| js_only_reason(&f, &types)) {

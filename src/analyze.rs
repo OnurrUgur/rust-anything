@@ -301,7 +301,7 @@ fn own_header(root: &Path, unit: &str) -> Option<(String, String)> {
 /// whose exports are all JS-shaped (plugin objects, callbacks) cannot be ported without an API
 /// change: it is marked `caution` and left out of `start_here`.
 fn check_bridgeable(root: &Path, report: &mut Report, lang: Lang) {
-    use crate::ts::exports::{exported_classes, exported_functions};
+    use crate::ts::exports::exported_classes;
     if lang == Lang::C {
         crate::lang::c::use_typedefs(root);
     }
@@ -322,17 +322,20 @@ fn check_bridgeable(root: &Path, report: &mut Report, lang: Lang) {
                     .iter()
                     .filter(|f| crate::bridge::js_only_reason(f, &[]).is_none())
                     .count();
-                bridgeable += classes.iter().filter(|c| c.blocker.is_none()).count();
+                bridgeable += classes
+                    .iter()
+                    .filter(|c| crate::bridge::class_reason(c, &[], false).is_none())
+                    .count();
                 continue;
             }
-            for mut f in exported_functions(file, &text) {
+            for f in crate::bridge::ts_functions(root, file, &text, &types) {
                 exports += 1;
-                crate::bridge::substitute_constraints(&mut f, &types);
                 bridgeable += usize::from(crate::bridge::js_only_reason(&f, &types).is_none());
             }
             for class in exported_classes(file, &text) {
                 exports += 1;
-                bridgeable += usize::from(class.blocker.is_none());
+                bridgeable +=
+                    usize::from(crate::bridge::class_reason(&class, &types, true).is_none());
             }
         }
         unit.exports = exports;

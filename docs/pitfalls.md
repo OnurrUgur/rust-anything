@@ -32,6 +32,11 @@ formatter with unported syntax) had no way to decline after reading stdin. Glue 
 doc trees. Case and input lines are read with `unbounded_depth` and the limit disabled, in the
 harness and in generated `from_json`; a test reads a 200-deep line.
 
+**`analyze` suggested a unit `bridge` refused.** It judged exports with its own copy of
+`bridge`'s rules, which lacked the sibling `.d.ts`, alias resolution and the class-method check,
+so a unit `bridge` keeps in JS went into `start_here`. Both now call `bridge::ts_functions` and
+`bridge::class_reason`; a new rule for what crosses the bridge goes there, not into one command.
+
 **A bridge found no functions in a module that exports a list.** `export { a, b as c }` was not
 read. `ts/exports.rs` reads export lists; check `bridge` on a unit written that way.
 
