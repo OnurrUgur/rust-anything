@@ -1156,14 +1156,17 @@ fn report(
             judged.insert(file.clone(), exports);
         }
     }
-    let exports_of =
-        |file: &str, name: &str| -> Option<(crate::ts::exports::ExportedFn, Option<String>)> {
-            judged
-                .get(file)?
-                .iter()
-                .find(|(f, _)| f.name == name)
-                .cloned()
-        };
+    let exports_of = |file: &str,
+                      name: &str,
+                      line: u32|
+     -> Option<(crate::ts::exports::ExportedFn, Option<String>)> {
+        let exports = judged.get(file)?;
+        exports
+            .iter()
+            .find(|(f, _)| f.name == name && f.line == line)
+            .or_else(|| exports.iter().find(|(f, _)| f.name == name))
+            .cloned()
+    };
     let repo_self: f64 = functions
         .iter()
         .filter(|(k, _)| in_repo(&k.0))
@@ -1174,7 +1177,7 @@ fn report(
         .filter(|((file, _, _), a)| in_repo(file) && total_ms > 0.0 && a.total_ms / total_ms >= 0.01)
         .map(|((file, name, line), a)| {
             let unit = unit_of(&file);
-            let (export, js_only) = match exports_of(&file, &name) {
+            let (export, js_only) = match exports_of(&file, &name, line) {
                 Some((f, reason)) => (Some(f), reason),
                 None => (None, None),
             };
@@ -1512,6 +1515,48 @@ mod tests {
             squares.advice
         );
         assert_eq!(crate::go::pick(&r, None).unwrap().function, "collatz");
+    }
+
+    #[test]
+    fn a_redefined_python_function_is_judged_by_the_definition_that_ran() {
+        let root =
+            std::env::temp_dir().join(format!("rust-anything-py-redef-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("demo")).unwrap();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("demo/__init__.py"), "").unwrap();
+        std::fs::write(
+            root.join("demo/mod.py"),
+            "def calc(xs):\n    for x in xs:\n        yield x * x\n\n\n\
+             def calc(n):\n    steps = 0\n    while n != 1:\n        n = n // 2 if n % 2 == 0 else 3 * n + 1\n        steps += 1\n    return steps\n",
+        )
+        .unwrap();
+        let functions: HashMap<Key, Acc> = [(
+            ("demo/mod.py".to_string(), "calc".to_string(), 6),
+            Acc {
+                self_ms: 90.0,
+                total_ms: 90.0,
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let r = report(
+            &root,
+            Lang::Python,
+            &["python3".into(), "bench.py".into()],
+            functions,
+            100.0,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let calc = r.hot.iter().find(|h| h.name == "calc").unwrap();
+        assert_eq!(calc.js_only, None, "{}", calc.advice);
+        assert_eq!(crate::go::pick(&r, None).unwrap().function, "calc");
     }
 
     #[test]
