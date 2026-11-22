@@ -11,6 +11,16 @@
   such a function and, when two hot functions share the name, takes the one that can cross; the
   functions `go` leaves in the original keep `bridge`'s own reason in `rust-anything.json`
   instead of "not hot in the profiled run"; `profile` reads and judges each hot file once.
+- `bridge` no longer refuses a Java, Kotlin or C# file because of an overloaded method. Every
+  overload of a name is kept in the original (the bindings name each export by its name
+  alone), but the duplicate-name check counted each kept overload, so the unit failed with "`pad`
+  is defined twice ... rename one of them" while `analyze` listed it as ready. An overload set
+  kept in the original is now one name in one file, also when `--keep` names it; other kept
+  functions that share a name still fail the check. C# blocked only the later overloads and
+  offered the first one for porting; it now keeps them all, as Java and Kotlin do, so `analyze`
+  stops counting it as bridgeable, and it tells overloads apart by class: `Json.Parse` and
+  `Xml.Parse` in one file are no longer called overloads (`bridge` still refuses them as one name
+  defined twice). The same overloaded name in two files of one unit is still refused.
 
 ## 3.3.0 (2026-11-22)
 
