@@ -49,6 +49,10 @@ pub struct Hot {
     pub advice: String,
     /// The unit may move to Rust (not marked keep or blocked).
     pub portable: bool,
+    /// Why `bridge` keeps this exported function in the source language (a callback, a RegExp,
+    /// a generator...), judged by the same rules `bridge` applies. `go` never picks it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub js_only: Option<String>,
     /// Parameters of the exported function.
     pub params: Vec<String>,
     /// `function:param` for `bridge --batch` when the advice is to batch it.
@@ -159,6 +163,46 @@ fn compiled_advice(root: &Path, h: &Hot, compiled: &[Compiled]) -> Option<String
         first.file,
         first.line
     ))
+}
+
+/// Loads the project-wide types `lang::exports` reads on this thread (C typedefs, C# shapes), as
+/// `bridge` does before it judges a unit.
+pub fn use_project_types(root: &Path, lang: Lang) {
+    match lang {
+        Lang::C => crate::lang::c::use_typedefs(root),
+        Lang::Csharp => crate::lang::csharp::use_shapes(root),
+        _ => {}
+    }
+}
+
+/// The exported functions of `file`, read as `bridge` reads them (for TS/JS a sibling `.d.ts` and
+/// type aliases applied), each with the reason `bridge` would keep it in the source language. Call
+/// [`use_project_types`] first, as `bridge` does.
+pub fn exports_judged(
+    root: &Path,
+    lang: Lang,
+    file: &str,
+    text: &str,
+) -> Vec<(crate::ts::exports::ExportedFn, Option<String>)> {
+    if lang == Lang::Ts {
+        let types = crate::bridge::types_in_scope(root, file, text);
+        crate::bridge::ts_functions(root, file, text, &types)
+            .into_iter()
+            .map(|f| {
+                let reason = crate::bridge::js_only_reason(&f, &types);
+                (f, reason)
+            })
+            .collect()
+    } else {
+        crate::lang::exports(lang, file, text)
+            .0
+            .into_iter()
+            .map(|f| {
+                let reason = crate::bridge::js_only_reason(&f, &[]);
+                (f, reason)
+            })
+            .collect()
+    }
 }
 
 /// One function's numbers before advice: key is (file, name, line).
@@ -1095,15 +1139,31 @@ fn report(
         );
         Some((u.id.clone(), portable))
     };
-    let exports_of = |file: &str, name: &str| -> Option<crate::ts::exports::ExportedFn> {
-        let text = std::fs::read_to_string(root.join(file)).ok()?;
-        let fns = if lang == Lang::Ts {
-            crate::ts::exports::exported_functions(file, &text)
-        } else {
-            crate::lang::exports(lang, file, &text).0
+    // Each hot file's exported functions, read and judged once, as `bridge` reads and judges
+    // them.
+    use_project_types(root, lang);
+    let mut judged: HashMap<String, Vec<(crate::ts::exports::ExportedFn, Option<String>)>> =
+        HashMap::new();
+    for ((file, _, _), a) in &functions {
+        if in_repo(file)
+            && total_ms > 0.0
+            && a.total_ms / total_ms >= 0.01
+            && !judged.contains_key(file)
+        {
+            let exports = std::fs::read_to_string(root.join(file))
+                .map(|text| exports_judged(root, lang, file, &text))
+                .unwrap_or_default();
+            judged.insert(file.clone(), exports);
+        }
+    }
+    let exports_of =
+        |file: &str, name: &str| -> Option<(crate::ts::exports::ExportedFn, Option<String>)> {
+            judged
+                .get(file)?
+                .iter()
+                .find(|(f, _)| f.name == name)
+                .cloned()
         };
-        fns.into_iter().find(|f| f.name == name)
-    };
     let repo_self: f64 = functions
         .iter()
         .filter(|(k, _)| in_repo(&k.0))
@@ -1114,7 +1174,10 @@ fn report(
         .filter(|((file, _, _), a)| in_repo(file) && total_ms > 0.0 && a.total_ms / total_ms >= 0.01)
         .map(|((file, name, line), a)| {
             let unit = unit_of(&file);
-            let export = exports_of(&file, &name);
+            let (export, js_only) = match exports_of(&file, &name) {
+                Some((f, reason)) => (Some(f), reason),
+                None => (None, None),
+            };
             let mut callers: Vec<Caller> = a
                 .callers
                 .iter()
@@ -1129,6 +1192,11 @@ fn report(
             let params: Vec<String> = export.as_ref().map(|e| e.params.iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
             let mut batch_spec = None;
             let advice = match (&unit, &export) {
+                (Some((_, true)), Some(_)) if js_only.is_some() => format!(
+                    "Hot, but `bridge` keeps `{name}` in {}: {}.",
+                    lang.name(),
+                    js_only.as_deref().unwrap_or_default()
+                ),
                 (Some((u, true)), Some(_)) if small_per_call && top.is_some() => {
                     let c = top.expect("checked");
                     let batch = batch_param(root, &(c.file.clone(), c.name.clone(), c.line), &name, &params);
@@ -1158,6 +1226,7 @@ fn report(
             };
             Hot {
                 portable: unit.as_ref().is_some_and(|(_, p)| *p),
+                js_only,
                 params,
                 batch: batch_spec,
                 unit: unit.map(|(u, _)| u),
@@ -1285,6 +1354,7 @@ mod tests {
             callers: Vec::new(),
             advice: "Port it.".into(),
             portable: true,
+            js_only: None,
             params: vec!["x".into()],
             batch: None,
         };
@@ -1301,6 +1371,147 @@ mod tests {
         assert!(compiled_advice(&root, &hot("other", 13), &compiled).is_none());
         assert!(compiled_in(&root, Lang::Ts).is_empty());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn functions_bridge_keeps_in_js_are_not_offered_for_porting() {
+        let root =
+            std::env::temp_dir().join(format!("rust-anything-js-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"demo","type":"module"}"#,
+        )
+        .unwrap();
+        // A typed callback in TypeScript, and the same shape in JS typed by a sibling `.d.ts`.
+        std::fs::write(
+            root.join("lib.ts"),
+            "export function sumBy<T>(items: T[], pick: (item: T) => number): number {\n  \
+             let s = 0;\n  for (const it of items) s += pick(it);\n  return s;\n}\n\
+             export function double(n: number): number { return n * 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plug.js"),
+            "export function each(items, visit) { for (const it of items) visit(it); }\n\
+             export function half(n) { return n / 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plug.d.ts"),
+            "export declare function each<T>(items: T[], visit: (item: T) => void): void;\n\
+             export declare function half(n: number): number;\n",
+        )
+        .unwrap();
+        let acc = |total_ms: f64| Acc {
+            self_ms: total_ms,
+            total_ms,
+            ..Default::default()
+        };
+        let functions: HashMap<Key, Acc> = [
+            (("lib.ts".to_string(), "sumBy".to_string(), 1), acc(60.0)),
+            (("plug.js".to_string(), "each".to_string(), 1), acc(20.0)),
+            (("plug.js".to_string(), "half".to_string(), 2), acc(10.0)),
+            (("lib.ts".to_string(), "double".to_string(), 6), acc(5.0)),
+        ]
+        .into_iter()
+        .collect();
+        let r = report(
+            &root,
+            Lang::Ts,
+            &["node".into(), "bench.mjs".into()],
+            functions,
+            100.0,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let hot = |name: &str| r.hot.iter().find(|h| h.name == name).unwrap();
+        for name in ["sumBy", "each"] {
+            let h = hot(name);
+            assert_eq!(
+                h.js_only.as_deref(),
+                Some("takes or returns a function"),
+                "{name}"
+            );
+            assert!(
+                h.advice.starts_with(&format!("Hot, but `bridge` keeps `{name}` in TypeScript/JavaScript: takes or returns a function.")),
+                "{}",
+                h.advice
+            );
+        }
+        for name in ["half", "double"] {
+            let h = hot(name);
+            assert_eq!(h.js_only, None, "{name}");
+            assert!(h.advice.starts_with("Hot and exported by"), "{}", h.advice);
+        }
+        // `go` passes over the hottest functions, which `bridge` would keep in JS.
+        assert_eq!(crate::go::pick(&r, None).unwrap().function, "half");
+        let named = crate::go::pick(&r, Some("sumBy")).unwrap_err().to_string();
+        assert!(named.contains("takes or returns a function"), "{named}");
+    }
+
+    #[test]
+    fn a_python_generator_is_not_offered_for_porting() {
+        let root =
+            std::env::temp_dir().join(format!("rust-anything-py-js-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("demo")).unwrap();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("demo/__init__.py"), "").unwrap();
+        std::fs::write(
+            root.join("demo/mod.py"),
+            "def squares(xs):\n    for x in xs:\n        yield x * x\n\n\n\
+             def collatz(n):\n    steps = 0\n    while n != 1:\n        n = n // 2 if n % 2 == 0 else 3 * n + 1\n        steps += 1\n    return steps\n",
+        )
+        .unwrap();
+        let acc = |total_ms: f64| Acc {
+            self_ms: total_ms,
+            total_ms,
+            ..Default::default()
+        };
+        let functions: HashMap<Key, Acc> = [
+            (
+                ("demo/mod.py".to_string(), "squares".to_string(), 1),
+                acc(60.0),
+            ),
+            (
+                ("demo/mod.py".to_string(), "collatz".to_string(), 6),
+                acc(30.0),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let r = report(
+            &root,
+            Lang::Python,
+            &["python3".into(), "bench.py".into()],
+            functions,
+            100.0,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let squares = r.hot.iter().find(|h| h.name == "squares").unwrap();
+        assert!(
+            squares
+                .js_only
+                .as_deref()
+                .is_some_and(|r| r.starts_with("generator")),
+            "{:?}",
+            squares.js_only
+        );
+        assert!(
+            squares
+                .advice
+                .starts_with("Hot, but `bridge` keeps `squares` in Python: generator"),
+            "{}",
+            squares.advice
+        );
+        assert_eq!(crate::go::pick(&r, None).unwrap().function, "collatz");
     }
 
     #[test]

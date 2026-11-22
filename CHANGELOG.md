@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `profile` and `go` judge each hot exported function with the rules `bridge` applies. A hot
+  function `bridge` keeps in the source language (one taking a callback, typed in TypeScript or
+  in a sibling `.d.ts`; a Python generator) was advised as "port it", and `go` picked it and
+  stopped with "every export ... must stay in TypeScript/JavaScript" (or Python). `profile` now
+  says why `bridge` keeps it (a new `js_only` field in `--json`), and `go` passes over it to the
+  next hot function that can cross, or says none can. `go --function f` names `bridge`'s reason for
+  such a function and, when two hot functions share the name, takes the one that can cross; the
+  functions `go` leaves in the original keep `bridge`'s own reason in `rust-anything.json`
+  instead of "not hot in the profiled run"; `profile` reads and judges each hot file once.
+
 ## 3.3.0 (2026-11-22)
 
 - `go` keeps the file's other classes in the original as well as its other functions. It kept

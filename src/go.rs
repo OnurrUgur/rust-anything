@@ -82,26 +82,37 @@ pub struct Outcome {
 }
 
 /// The function to port: the first hot one (most time, so the outermost loop) that is exported
-/// by a portable unit and takes arguments to record.
+/// by a portable unit, can cross the bridge, and takes arguments to record.
 pub fn pick(report: &Report, function: Option<&str>) -> Result<Pick> {
-    let eligible = |h: &&Hot| h.unit.is_some() && h.portable && h.exported && !h.params.is_empty();
+    let eligible = |h: &&Hot| {
+        h.unit.is_some() && h.portable && h.js_only.is_none() && h.exported && !h.params.is_empty()
+    };
     let hot = match function {
         Some(name) => report
             .hot
             .iter()
-            .find(|h| h.name == name)
+            .filter(|h| h.name == name)
+            .find(eligible)
+            .or_else(|| report.hot.iter().find(|h| h.name == name))
             .with_context(|| {
                 format!("`{name}` is not among the hot functions of this run (see `rust-anything profile`)")
             })?,
         None => report.hot.iter().find(eligible).with_context(|| {
             format!(
                 "no hot function to port: none of the {} hot functions is exported by a portable \
-                 unit and takes arguments. `rust-anything profile` shows why.",
+                 unit, can cross the bridge and takes arguments. `rust-anything profile` shows why.",
                 report.hot.len()
             )
         })?,
     };
     if !eligible(&hot) {
+        if let Some(reason) = &hot.js_only {
+            bail!(
+                "`{}` cannot be bridged: `bridge` keeps it in {}: {reason}",
+                hot.name,
+                report.language.name()
+            );
+        }
         bail!("`{}` cannot be bridged: {}", hot.name, hot.advice);
     }
     let why = match &hot.batch {
@@ -138,21 +149,22 @@ pub fn crate_name(function: &str) -> String {
     )
 }
 
-/// The other exported functions of the file, kept in the original so the crate ports one.
+/// The other exported functions and classes of the file, kept in the original so the crate ports
+/// one. A function `bridge` keeps in the original anyway is left to `bridge`, which records its
+/// own reason.
 fn others(root: &Path, lang: Lang, file: &str, function: &str) -> Result<Vec<String>> {
     let text =
         std::fs::read_to_string(root.join(file)).with_context(|| format!("reading {file}"))?;
-    let (fns, classes) = if lang == Lang::Ts {
-        (
-            crate::ts::exports::exported_functions(file, &text),
-            crate::ts::exports::exported_classes(file, &text),
-        )
+    crate::profile::use_project_types(root, lang);
+    let classes = if lang == Lang::Ts {
+        crate::ts::exports::exported_classes(file, &text)
     } else {
-        crate::lang::exports(lang, file, &text)
+        crate::lang::exports(lang, file, &text).1
     };
-    Ok(fns
+    Ok(crate::profile::exports_judged(root, lang, file, &text)
         .into_iter()
-        .map(|f| f.name)
+        .filter(|(_, reason)| reason.is_none())
+        .map(|(f, _)| f.name)
         .chain(classes.into_iter().map(|c| c.name))
         .filter(|n| n != function)
         .map(|n| format!("{n}: not hot in the profiled run; `go` ports one function"))
@@ -631,6 +643,7 @@ mod tests {
             }],
             advice: "Hot, outside the analyzed units.".into(),
             portable: unit,
+            js_only: None,
             params: params.iter().map(|p| p.to_string()).collect(),
             batch: batch.map(str::to_string),
         }
@@ -690,6 +703,50 @@ mod tests {
         assert!(pick(&r, Some("load")).is_err());
         assert!(pick(&r, Some("missing")).is_err());
         assert!(pick(&r, None).is_err());
+    }
+
+    #[test]
+    fn a_named_function_bridge_keeps_says_why_and_yields_to_one_that_can_cross() {
+        let kept = || {
+            let mut h = hot("calc", 60.0, true, &["xs", "cb"], None);
+            h.js_only = Some("takes or returns a function".into());
+            h
+        };
+        let only = pick(&report(vec![kept()]), Some("calc"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            only.contains("`bridge` keeps it in Python: takes or returns a function"),
+            "{only}"
+        );
+        let r = report(vec![kept(), hot("calc", 20.0, true, &["n"], None)]);
+        assert_eq!(pick(&r, Some("calc")).unwrap().total_pct, 20.0);
+    }
+
+    #[test]
+    fn functions_bridge_keeps_are_left_to_bridge_for_their_reason() {
+        let root =
+            std::env::temp_dir().join(format!("rust-anything-go-others-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("plug.js"),
+            "export function each(items, visit) { for (const it of items) visit(it); }\n\
+             export function half(n) { return n / 2; }\n\
+             export function third(n) { return n / 3; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plug.d.ts"),
+            "export declare function each<T>(items: T[], visit: (item: T) => void): void;\n",
+        )
+        .unwrap();
+        let keep = others(&root, Lang::Ts, "plug.js", "half").unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            keep,
+            ["third: not hot in the profiled run; `go` ports one function"]
+        );
     }
 
     #[test]
