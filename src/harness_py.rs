@@ -389,7 +389,34 @@ def call_args(args):
     return [dec(a) for a in args]
 
 
-def run_case(mod, c):
+def binding_name(name):
+    """The name the Rust bindings give a parameter: `bridge::snake_case`, without `r#`."""
+    out = []
+    for i, ch in enumerate(name):
+        if ch.isupper():
+            prev = name[i - 1] if i else ""
+            nxt = name[i + 1:i + 2]
+            if prev and (prev.islower() or "0" <= prev <= "9") or (prev.isupper() and nxt.islower()):
+                out.append("_")
+            out.append(ch.lower())
+        else:
+            out.append(ch if ch.isalnum() else "_")
+    return "".join(out)
+
+
+def call_kwargs(c, rename=None):
+    """Keyword arguments by their names in the original, or in the bindings with `rename`."""
+    return {(rename(k) if rename else k): dec(v) for k, v in c.get("kwargs", {}).items()}
+
+
+def shown_args(c):
+    """A case's arguments as mismatches show them: keyword arguments appended, as Ruby does."""
+    if c.get("class"):
+        return [c.get("ctor"), c.get("calls")]
+    return c["args"] + [c["kwargs"]] if c.get("kwargs") else c["args"]
+
+
+def run_case(mod, c, rename=None):
     if c.get("class"):
         cls = getattr(mod, c["class"])
         results = []
@@ -409,7 +436,7 @@ def run_case(mod, c):
             except BaseException as e:  # noqa: BLE001
                 results.append({"error": error_text(e)})
         return {"results": results}
-    kwargs = {k: dec(v) for k, v in c.get("kwargs", {}).items()}
+    kwargs = call_kwargs(c, rename)
     try:
         return {"ok": enc(getattr(mod, c["fn"])(*call_args(c["args"]), **kwargs))}
     except (KeyboardInterrupt, SystemExit):
@@ -474,7 +501,7 @@ def diff(cases_path, out_path, package_dir, name, key_order):
             continue
         if PIN_CASE:
             PIN_CASE(index)
-        got = run_case(mod, c)
+        got = run_case(mod, c, binding_name)
         if c.get("class"):
             want, have = c["results"], got["results"]
             ok = len(want) == len(have) and all(same(w, h, sort) for w, h in zip(want, have))
@@ -487,7 +514,7 @@ def diff(cases_path, out_path, package_dir, name, key_order):
             summary["passed"] += 1
         else:
             summary["failed"] += 1
-            summary["mismatches"].append({"fn": name_, "args": c.get("args", [c.get("ctor"), c.get("calls")]), "expected": expected, "actual": actual})
+            summary["mismatches"].append({"fn": name_, "args": shown_args(c), "expected": expected, "actual": actual})
     json.dump(summary, open(out_path, "w", encoding="utf-8"), ensure_ascii=False)
 
 
@@ -505,15 +532,15 @@ def bench(cases_path, out_path, package_dir, name, modules_path, min_ms):
             continue
         old = load(sources[key])
 
-        def timed(mod):
+        def timed(mod, rename=None):
             if cases[0].get("class"):
                 def once():
                     for c in cases:
-                        run_case(mod, c)
+                        run_case(mod, c, rename)
             else:
                 # Arguments are decoded once: only the calls are timed.
                 fn = getattr(mod, key)
-                prepared = [(call_args(c["args"]), {k: dec(v) for k, v in c.get("kwargs", {}).items()}) for c in cases]
+                prepared = [(call_args(c["args"]), call_kwargs(c, rename)) for c in cases]
 
                 def once():
                     for args, kwargs in prepared:
@@ -531,7 +558,7 @@ def bench(cases_path, out_path, package_dir, name, modules_path, min_ms):
                 elapsed = time.perf_counter() - start
                 if elapsed * 1000 >= min_ms:
                     return elapsed * 1e9 / (passes * len(cases))
-        original_ns, rust_ns = timed(old), timed(new)
+        original_ns, rust_ns = timed(old), timed(new, binding_name)
         label = f"class {key}" if cases[0].get("class") else key
         rows.append({"fn": label, "cases": len(cases), "original_ns": original_ns, "rust_ns": rust_ns, "speedup": original_ns / rust_ns})
     json.dump(rows, open(out_path, "w", encoding="utf-8"))
