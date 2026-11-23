@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `doctor` checks that PHP has the `FFI` extension loaded (`php -m`), not only PHP 8.0+
+  (#240). When `FFI` is missing, the PHP line says so with how to enable or install it, and stays
+  optional so the report does not fail.
 - `profile` says when the time goes to child processes, not code (#208). Time under Node's
   `execSync`, `execFileSync` and `spawnSync`, and under Python's `subprocess` calls and
   `os.system`, is a new "Child processes" section and a `child_processes` field in `--json`

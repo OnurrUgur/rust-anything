@@ -471,6 +471,33 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Whether `php -m` lists the `FFI` extension.
+pub fn php_has_ffi(modules: &str) -> bool {
+    modules
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("ffi"))
+}
+
+fn php_modules(program: &str) -> Option<String> {
+    let out =
+        crate::process::output(Command::new(program).arg("-m"), crate::process::QUICK).ok()?;
+    out.success().then(|| out.stdout_text())
+}
+
+fn php_ffi_fix(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => {
+            "brew install php  (or enable `extension=ffi` in the `php.ini` shown by `php --ini`)"
+        }
+        Platform::Windows => {
+            "enable `extension=ffi` (and `extension_dir=\"ext\"`) in the `php.ini` shown by `php --ini`"
+        }
+        Platform::Other => {
+            "enable `extension=ffi` in the `php.ini` shown by `php --ini` (or install `php-ffi`)"
+        }
+    }
+}
+
 fn runtime(r: &Runtime) -> Check {
     let banner = probe(r.program, r.args);
     let version = banner.as_deref().and_then(if r.java {
@@ -478,21 +505,54 @@ fn runtime(r: &Runtime) -> Check {
     } else {
         parse_version
     });
-    let status = grade(banner.is_some(), version, r.minimum);
-    let mut detail = match (&banner, r.minimum) {
+    let modules = (r.name == "php" && grade(banner.is_some(), version, r.minimum) == Status::Ok)
+        .then(|| php_modules(r.program))
+        .flatten();
+    runtime_check(r, banner.as_deref(), modules.as_deref(), Platform::HERE)
+}
+
+fn runtime_check(
+    r: &Runtime,
+    banner: Option<&str>,
+    php_modules: Option<&str>,
+    platform: Platform,
+) -> Check {
+    let version = banner.and_then(if r.java {
+        parse_java_version
+    } else {
+        parse_version
+    });
+    let mut status = grade(banner.is_some(), version, r.minimum);
+    let mut detail = match (banner, r.minimum) {
         (None, _) => format!("`{}` not found or did not run", r.program),
         (Some(b), Some(min)) if status == Status::Outdated => {
             format!("{b}; rust-anything needs {}.{}+", min.0, min.1)
         }
-        (Some(b), _) => b.clone(),
+        (Some(b), _) => b.to_string(),
     };
     if r.name == "node" && status == Status::Ok && version.is_some_and(|v| v.0 < 24) {
         detail.push_str("; works, but `profile` needs Node 24");
     }
     if r.name == "ruby" && status == Status::Outdated {
         detail.push_str("; magnus/rb-sys extensions do not build on Ruby 2");
-        if cfg!(target_os = "macos") && which("ruby").is_some_and(|p| p.starts_with("/usr/bin")) {
+        if platform == Platform::MacOs && which("ruby").is_some_and(|p| p.starts_with("/usr/bin")) {
             detail.push_str(" (this is macOS's system Ruby)");
+        }
+    }
+    let mut fix = runtime_fix(r, status, platform);
+    if r.name == "php" && status == Status::Ok {
+        match php_modules {
+            Some(m) if php_has_ffi(m) => detail.push_str(" (FFI loaded)"),
+            Some(_) => {
+                status = Status::Missing;
+                detail.push_str("; FFI extension not loaded");
+                fix = Some(php_ffi_fix(platform).to_string());
+            }
+            None => {
+                status = Status::Missing;
+                detail.push_str("; could not check the FFI extension (`php -m` failed)");
+                fix = Some(php_ffi_fix(platform).to_string());
+            }
         }
     }
     Check {
@@ -500,7 +560,7 @@ fn runtime(r: &Runtime) -> Check {
         status,
         required: r.required,
         detail,
-        fix: runtime_fix(r, status, Platform::HERE),
+        fix,
     }
 }
 
@@ -1205,5 +1265,58 @@ mod tests {
         let lines: Vec<_> = out.lines().collect();
         assert!(lines[1].trim_start().starts_with("fix: first"), "{out}");
         assert_eq!(lines[1].find("first"), lines[2].find("second"), "{out}");
+    }
+
+    #[test]
+    fn php_requires_the_ffi_extension_and_stays_optional() {
+        let php = runtime_named("php");
+        let banner = Some("PHP 8.3.4 (cli) (built: Mar 12 2024)");
+        assert!(php_has_ffi("[PHP Modules]\nCore\nFFI\njson\n"));
+        assert!(php_has_ffi("  ffi \n"));
+        assert!(!php_has_ffi("[PHP Modules]\nCore\nfileinfo\njson\n"));
+        assert!(!php_has_ffi(
+            "PHP Warning: Unable to load dynamic library 'ffi'\n[PHP Modules]\nCore\n"
+        ));
+
+        let loaded = runtime_check(
+            php,
+            banner,
+            Some("[PHP Modules]\nCore\nFFI\n"),
+            Platform::Other,
+        );
+        assert_eq!(loaded.status, Status::Ok);
+        assert!(!loaded.required);
+        assert!(loaded.detail.ends_with("(FFI loaded)"), "{}", loaded.detail);
+        assert_eq!(loaded.fix, None);
+
+        for platform in [Platform::MacOs, Platform::Windows, Platform::Other] {
+            let no_ffi = runtime_check(php, banner, Some("[PHP Modules]\nCore\n"), platform);
+            assert_eq!(no_ffi.status, Status::Missing);
+            assert!(!no_ffi.required);
+            assert!(
+                no_ffi.detail.contains("FFI extension not loaded"),
+                "{}",
+                no_ffi.detail
+            );
+            let fix = no_ffi.fix.as_deref().expect("a fix when FFI is missing");
+            assert!(fix.contains("extension=ffi"), "{platform:?}: {fix}");
+            assert!(!fix.contains("| sh"), "{platform:?}: {fix}");
+            assert!(
+                Report {
+                    checks: vec![no_ffi]
+                }
+                .ok(),
+                "missing FFI stays optional"
+            );
+        }
+
+        let probe_failed = runtime_check(php, banner, None, Platform::Other);
+        assert_eq!(probe_failed.status, Status::Missing);
+        assert!(probe_failed.detail.contains("`php -m` failed"));
+        assert!(probe_failed.fix.is_some());
+
+        let old = runtime_check(php, Some("PHP 7.4.33 (cli)"), None, Platform::Other);
+        assert_eq!(old.status, Status::Outdated);
+        assert!(old.detail.contains("needs 8.0+"));
     }
 }
