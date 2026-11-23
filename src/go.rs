@@ -128,19 +128,19 @@ pub fn pick(report: &Report, function: Option<&str>) -> Result<Pick> {
         })?,
     };
     if !eligible(&hot) {
+        if let Some(reason) = &hot.js_only {
+            bail!(
+                "`{}` cannot be bridged: `bridge` keeps it in {}: {reason}",
+                hot.name,
+                report.language.name()
+            );
+        }
         if hot.mostly_waits() {
             bail!(
                 "`{}` spends {:.0}% of its time waiting on child processes. {}",
                 hot.name,
                 hot.child_pct.unwrap_or_default(),
                 crate::profile::CHILD_ADVICE
-            );
-        }
-        if let Some(reason) = &hot.js_only {
-            bail!(
-                "`{}` cannot be bridged: `bridge` keeps it in {}: {reason}",
-                hot.name,
-                report.language.name()
             );
         }
         bail!("`{}` cannot be bridged: {}", hot.name, hot.advice);
@@ -762,6 +762,20 @@ mod tests {
         );
         r.hot.push(hot("parse", 30.0, true, &["text"], None));
         assert_eq!(pick(&r, None).unwrap().function, "parse");
+    }
+
+    #[test]
+    fn a_named_function_bridge_keeps_says_so_even_when_it_waits() {
+        let mut h = hot("each", 80.0, true, &["items"], None);
+        h.js_only = Some("takes or returns a function".into());
+        h.child_pct = Some(70.0);
+        let named = pick(&report(vec![h]), Some("each"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            named.contains("cannot be bridged") && named.contains("takes or returns a function"),
+            "{named}"
+        );
     }
 
     #[test]
