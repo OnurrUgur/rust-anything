@@ -58,6 +58,35 @@ pub struct Hot {
     /// `function:param` for `bridge --batch` when the advice is to batch it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<String>,
+    /// Share of this function's time spent waiting on child processes it started, itself or
+    /// through the functions it calls. `go` passes over a function that mostly waits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_pct: Option<f64>,
+}
+
+impl Hot {
+    /// Most of its time goes to waiting on child processes: the same work in Rust still waits.
+    pub fn mostly_waits(&self) -> bool {
+        self.child_pct.is_some_and(|p| p >= 50.0)
+    }
+}
+
+/// Time a function in user code (the repository or the workload script) spent waiting on child
+/// processes it started (`execSync`, `subprocess.run`, `os.system`...), itself or through a
+/// library.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChildProcess {
+    /// The program, when the call passes it as a literal (`sleep` for `execSync("sleep 0.2")`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub file: String,
+    /// The call's line when the function makes one such call, else the function's line.
+    pub line: u32,
+    /// The function that makes the call.
+    pub function: String,
+    pub ms: f64,
+    /// Percent of the whole run.
+    pub share: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +101,49 @@ pub struct Report {
     /// Functions the repository already compiles to machine code (numba, Cython, JAX).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub compiled: Vec<Compiled>,
+    /// Percent of the run spent waiting on child processes; 0 below 1%.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub child_pct: f64,
+    /// Where the run waits on child processes, longest first (each at least 1% of the run).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub child_processes: Vec<ChildProcess>,
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
+}
+
+/// What to do instead of porting when the time goes to child processes.
+pub const CHILD_ADVICE: &str = "Porting code will not speed this up: keep one long-lived process \
+                                open, batch the commands, or call the API directly.";
+
+impl Report {
+    /// "38% of the run waits on child processes (`sleep` from `lib.js:6`)." With several,
+    /// "(mostly `sleep` from ...)".
+    pub fn child_summary(&self) -> Option<String> {
+        if self.child_pct < 1.0 {
+            return None;
+        }
+        let Some(top) = self.child_processes.first() else {
+            return Some(format!(
+                "{:.0}% of the run waits on child processes.",
+                self.child_pct
+            ));
+        };
+        let from = match &top.command {
+            Some(c) => format!("`{c}` from `{}:{}`", top.file, top.line),
+            None => format!("from `{}` at `{}:{}`", top.function, top.file, top.line),
+        };
+        let mostly = if self.child_processes.len() > 1 {
+            "mostly "
+        } else {
+            ""
+        };
+        Some(format!(
+            "{:.0}% of the run waits on child processes ({mostly}{from}).",
+            self.child_pct
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +284,10 @@ struct Acc {
     total_ms: f64,
     calls: Option<u64>,
     callers: HashMap<(String, String, u32), (f64, Option<u64>)>,
+    /// Waiting on child processes this function started itself.
+    spawn_ms: f64,
+    /// Waiting on child processes under this function, its callees' included.
+    waits_ms: f64,
 }
 
 type Key = (String, String, u32);
@@ -283,7 +359,7 @@ fn relative(root: &Path, file: &str) -> Option<String> {
                 | "gems"
                 | "vendor"
         )
-    }) || ["/lib/python3", "/lib/ruby/", "/pkg/mod/"]
+    }) || ["/lib/python3", "/lib64/python3", "/lib/ruby/", "/pkg/mod/"]
         .iter()
         .any(|d| path.contains(d))
         || goroot().is_some_and(|g| path.starts_with(g))
@@ -358,7 +434,12 @@ struct Frame {
     key: Option<Key>,
     self_ms: f64,
     children: Vec<u64>,
+    /// `execSync` and its kin: the thread blocks until the child process exits.
+    spawn: bool,
 }
+
+/// `node:child_process` functions that block until the child exits.
+const NODE_SPAWNS: [&str; 3] = ["execSync", "execFileSync", "spawnSync"];
 
 /// Adds one `.cpuprofile` to `functions`; returns its duration in ms.
 fn merge_cpuprofile(root: &Path, profile: &Value, functions: &mut HashMap<Key, Acc>) -> f64 {
@@ -391,12 +472,14 @@ fn merge_cpuprofile(root: &Path, profile: &Value, functions: &mut HashMap<Key, A
             .map_or_else(Vec::new, |c| c.iter().filter_map(Value::as_u64).collect());
         is_child.extend(children.iter().copied());
         let self_ms = n["hitCount"].as_f64().unwrap_or(0.0) * per_sample;
+        let spawn = url == "node:child_process" && NODE_SPAWNS.contains(&name.as_str());
         by_id.insert(
             id,
             Frame {
                 key,
                 self_ms,
                 children,
+                spawn,
             },
         );
     }
@@ -431,10 +514,30 @@ fn merge_cpuprofile(root: &Path, profile: &Value, functions: &mut HashMap<Key, A
             key,
             self_ms,
             children,
+            spawn,
         }) = by_id.get(&id)
         else {
             continue;
         };
+        if *spawn {
+            // The outermost blocking call: everything under it is the wait (`execSync` calls
+            // `spawnSync`). It goes to the nearest named user frame, as callers do, and counts
+            // once for each frame on the stack.
+            if let Some(caller) = active
+                .iter()
+                .rev()
+                .find(|c| !c.1.starts_with("(anonymous)"))
+                .or(active.last())
+            {
+                let waited = total(id, &by_id, &mut memo);
+                functions.entry(caller.clone()).or_default().spawn_ms += waited;
+                let mut seen = HashSet::new();
+                for k in active.iter().filter(|k| seen.insert(*k)) {
+                    functions.entry(k.clone()).or_default().waits_ms += waited;
+                }
+            }
+            continue;
+        }
         let mut next = active.clone();
         if let Some(k) = key {
             let inclusive = total(id, &by_id, &mut memo);
@@ -524,7 +627,8 @@ fn python(root: &Path, command: &[String], work: &Path) -> Result<(HashMap<Key, 
 fn ingest_entries(root: &Path, entries: &[Value]) -> HashMap<Key, Acc> {
     let mut functions: HashMap<Key, Acc> = HashMap::new();
     for e in entries {
-        let Some(file) = relative(root, e["file"].as_str().unwrap_or("")) else {
+        let raw_file = e["file"].as_str().unwrap_or("");
+        let Some(file) = relative(root, raw_file) else {
             continue;
         };
         let key = (
@@ -550,7 +654,238 @@ fn ingest_entries(root: &Path, entries: &[Value]) -> HashMap<Key, Acc> {
             slot.1 = Some(slot.1.unwrap_or(0) + c["calls"].as_u64().unwrap_or(0));
         }
     }
+    child_waits(root, entries, &mut functions);
     functions
+}
+
+/// Python's calls that wait for a child process: `subprocess.run` and its kin, a `Popen`'s
+/// `communicate`, `wait` and `__exit__` (`with Popen(...)`), and `os.system` (a Python wrapper on some versions, a builtin on
+/// others).
+fn python_spawn(file: &str, name: &str) -> bool {
+    let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    (base == "subprocess.py"
+        && matches!(
+            name,
+            "run"
+                | "call"
+                | "check_call"
+                | "check_output"
+                | "getoutput"
+                | "getstatusoutput"
+                | "communicate"
+                | "wait"
+                | "__exit__"
+        ))
+        || (base == "os.py" && name == "system")
+        || (file == "~"
+            && matches!(
+                name,
+                "<built-in method posix.system>" | "<built-in method nt.system>"
+            ))
+}
+
+/// Waits on child processes in a tracing profile (Python's `subprocess` calls). The caller edges
+/// are followed through library frames too (`fetch` -> a library's `run_git` ->
+/// `subprocess.run`): each user function gets the waits under it (`waits_ms`) and the ones it
+/// starts with no user function in between (`spawn_ms`).
+fn child_waits(root: &Path, entries: &[Value], functions: &mut HashMap<Key, Acc>) {
+    let raw = |v: &Value| -> Key {
+        (
+            v["file"].as_str().unwrap_or("").to_string(),
+            v["name"].as_str().unwrap_or("").to_string(),
+            u32::try_from(v["line"].as_u64().unwrap_or(0)).unwrap_or(0),
+        )
+    };
+    // The standard library's, not a repository module that happens to be called `subprocess.py`.
+    let is_spawn =
+        |k: &Key| python_spawn(&k.0, &k.1) && relative(root, &k.0).is_none_or(|f| !in_repo(&f));
+    if !entries.iter().any(|e| is_spawn(&raw(e))) {
+        return;
+    }
+    let mut ids: HashMap<Key, usize> = HashMap::new();
+    let mut keys: Vec<Key> = Vec::new();
+    let mut id = |k: Key| -> usize {
+        *ids.entry(k.clone()).or_insert_with(|| {
+            keys.push(k);
+            keys.len() - 1
+        })
+    };
+    let mut edges: Vec<(usize, usize, f64)> = Vec::new(); // (caller, callee, ms)
+    let mut spawn_edges: Vec<(usize, f64)> = Vec::new(); // (caller, ms)
+    let mut totals: Vec<(usize, f64)> = Vec::new();
+    for e in entries {
+        let me = raw(e);
+        let spawner = is_spawn(&me);
+        let i = id(me);
+        totals.push((i, e["total"].as_f64().unwrap_or(0.0)));
+        for c in e["callers"].as_array().into_iter().flatten() {
+            let ck = raw(c);
+            let ms = c["total"].as_f64().unwrap_or(0.0);
+            if spawner {
+                // The outermost waiting call: `subprocess.run` calls `communicate`, which calls
+                // `wait`; each wait counts once.
+                if !is_spawn(&ck) {
+                    spawn_edges.push((id(ck), ms));
+                }
+            } else if !is_spawn(&ck) {
+                edges.push((id(ck), i, ms));
+            }
+        }
+    }
+    let n = keys.len();
+    let mut g = Graph {
+        total: vec![0.0; n],
+        spawn: vec![0.0; n],
+        callees: vec![Vec::new(); n],
+        callers: vec![Vec::new(); n],
+    };
+    for (i, t) in totals {
+        g.total[i] += t;
+    }
+    for (c, ms) in spawn_edges {
+        g.spawn[c] += ms;
+    }
+    for (caller, callee, ms) in edges {
+        if caller != callee && g.total[callee] > 0.0 {
+            g.callees[caller].push((callee, (ms / g.total[callee]).min(1.0)));
+            g.callers[callee].push(caller);
+        }
+    }
+    let user: Vec<Option<Key>> = keys
+        .iter()
+        .map(|k| {
+            (!is_spawn(k))
+                .then(|| relative(root, &k.0).map(|f| (f, k.1.clone(), k.2)))
+                .flatten()
+        })
+        .collect();
+    let waits = g.waits(|_| true);
+    // Waits started by library frames and reaching a frame through library frames only, so a
+    // user function's own waits are not listed again for its user caller, nor for itself when
+    // it recurses through a library (`ast.NodeVisitor`).
+    let foreign = g.waits(|c| user[c].is_none());
+    for (i, k) in user.iter().enumerate() {
+        let Some(acc) = k.as_ref().and_then(|k| functions.get_mut(k)) else {
+            continue;
+        };
+        acc.waits_ms += waits[i];
+        acc.spawn_ms += g.spawn[i]
+            + g.callees[i]
+                .iter()
+                .filter(|(c, _)| user[*c].is_none())
+                .map(|(c, share)| share * foreign[*c])
+                .sum::<f64>();
+    }
+}
+
+/// A call graph over a tracing profile's frames.
+struct Graph {
+    total: Vec<f64>,
+    /// Waits on child processes started by this frame itself.
+    spawn: Vec<f64>,
+    /// caller -> [(callee, share of the callee's time spent under this caller)]
+    callees: Vec<Vec<(usize, f64)>>,
+    callers: Vec<Vec<usize>>,
+}
+
+impl Graph {
+    /// Waits under each frame, counting only the frames `only` accepts: its own, plus each
+    /// callee's in the share of the callee's time spent under it, never more than its own time.
+    /// Recursion (a cycle of calls) shares one total, so no wait goes around a cycle twice.
+    fn waits(&self, only: impl Fn(usize) -> bool) -> Vec<f64> {
+        let n = self.total.len();
+        // Only frames above a wait matter.
+        let mut relevant = vec![false; n];
+        let mut todo: Vec<usize> = (0..n).filter(|&i| self.spawn[i] > 0.0 && only(i)).collect();
+        while let Some(i) = todo.pop() {
+            if !std::mem::replace(&mut relevant[i], true) {
+                todo.extend(self.callers[i].iter().copied().filter(|&c| !relevant[c]));
+            }
+        }
+        let mut waits = vec![0.0; n];
+        let mut component = vec![usize::MAX; n];
+        for (id, scc) in sccs(&self.callees, &relevant).into_iter().enumerate() {
+            for &m in &scc {
+                component[m] = id;
+            }
+            let own: f64 = scc
+                .iter()
+                .filter(|&&m| only(m))
+                .map(|&m| self.spawn[m])
+                .sum();
+            let under: f64 = scc
+                .iter()
+                .flat_map(|&m| self.callees[m].iter())
+                .filter(|(c, _)| relevant[*c] && component[*c] != id && only(*c))
+                .map(|(c, share)| share * waits[*c])
+                .sum();
+            for &m in &scc {
+                waits[m] = (own + under).min(self.total[m].max(self.spawn[m]));
+            }
+        }
+        waits
+    }
+}
+
+/// Strongly connected components of the relevant frames, callees before their callers
+/// (Tarjan's algorithm, without recursion).
+fn sccs(edges: &[Vec<(usize, f64)>], relevant: &[bool]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0; n];
+    let mut on_stack = vec![false; n];
+    let mut stack = Vec::new();
+    let mut out = Vec::new();
+    let mut next = 0;
+    for start in (0..n).filter(|&i| relevant[i]) {
+        if index[start] != usize::MAX {
+            continue;
+        }
+        index[start] = next;
+        low[start] = next;
+        next += 1;
+        stack.push(start);
+        on_stack[start] = true;
+        // (frame, next edge to look at)
+        let mut work = vec![(start, 0usize)];
+        while let Some(&(v, e)) = work.last() {
+            if let Some(&(w, _)) = edges[v].get(e) {
+                if let Some(top) = work.last_mut() {
+                    top.1 += 1;
+                }
+                if !relevant[w] {
+                    continue;
+                }
+                if index[w] == usize::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut scc = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    scc.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(scc);
+            }
+        }
+    }
+    out
 }
 
 // ---- stack samples (Go pprof, Java JFR) -----------------------------------------------------
@@ -1172,6 +1507,33 @@ fn report(
         .filter(|(k, _)| in_repo(&k.0))
         .map(|(_, a)| a.self_ms)
         .sum();
+    let mut calls_in: HashMap<&str, Vec<SpawnCall>> = HashMap::new();
+    let mut child_processes: Vec<ChildProcess> = functions
+        .iter()
+        .filter(|(_, a)| total_ms > 0.0 && a.spawn_ms / total_ms >= 0.01)
+        .map(|((file, name, line), a)| {
+            let calls = calls_in
+                .entry(file.as_str())
+                .or_insert_with(|| spawn_calls_in(root, lang, file));
+            let (line, command) = spawn_site(calls, name, *line).unwrap_or((*line, None));
+            ChildProcess {
+                command,
+                file: file.clone(),
+                line,
+                function: name.clone(),
+                ms: a.spawn_ms,
+                share: 100.0 * a.spawn_ms / total_ms,
+            }
+        })
+        .collect();
+    child_processes.sort_by(|a, b| b.ms.total_cmp(&a.ms));
+    // Every wait counts once, at the frame that starts it, so the parts add up to the whole.
+    let child_pct = if total_ms > 0.0 {
+        (100.0 * functions.values().map(|a| a.spawn_ms).sum::<f64>() / total_ms).min(100.0)
+    } else {
+        0.0
+    };
+    let child_pct = if child_pct >= 1.0 { child_pct } else { 0.0 };
     let mut hot: Vec<Hot> = functions
         .into_iter()
         .filter(|((file, _, _), a)| in_repo(file) && total_ms > 0.0 && a.total_ms / total_ms >= 0.01)
@@ -1193,8 +1555,14 @@ fn report(
             let top = callers.first();
             let small_per_call = ns_per_call.is_some_and(|ns| ns < 20_000.0) || (a.calls.is_none() && top.is_some_and(|c| c.ms >= 0.5 * a.total_ms));
             let params: Vec<String> = export.as_ref().map(|e| e.params.iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
+            let child_pct = (a.total_ms > 0.0 && a.waits_ms / a.total_ms >= 0.01)
+                .then(|| (100.0 * a.waits_ms / a.total_ms).min(100.0));
             let mut batch_spec = None;
             let advice = match (&unit, &export) {
+                _ if child_pct.is_some_and(|p| p >= 50.0) => format!(
+                    "Hot, but {:.0}% of its time waits on child processes. {CHILD_ADVICE}",
+                    child_pct.unwrap_or_default()
+                ),
                 (Some((_, true)), Some(_)) if js_only.is_some() => format!(
                     "Hot, but `bridge` keeps `{name}` in {}: {}.",
                     lang.name(),
@@ -1232,6 +1600,7 @@ fn report(
                 js_only,
                 params,
                 batch: batch_spec,
+                child_pct,
                 unit: unit.map(|(u, _)| u),
                 exported: export.is_some(),
                 name,
@@ -1267,6 +1636,286 @@ fn report(
         },
         compiled,
         hot,
+        child_pct,
+        child_processes,
+    }
+}
+
+/// Where the function `name` defined at `line` starts its child process: the call's line, and
+/// the program when the call names it literally. A call in a callback counts for the function
+/// around it, as the wait does. `None` when there is no such call, or several that start
+/// different programs.
+fn spawn_site(calls: &[SpawnCall], name: &str, line: u32) -> Option<(u32, Option<String>)> {
+    // A file's top level: Python's `<module>`, Node's module function on line 1.
+    let top = name == "<module>" || (line == 1 && name.starts_with("(anonymous)"));
+    let own: Vec<&SpawnCall> = calls
+        .iter()
+        .filter(|c| c.scopes.last() == Some(&line) || (top && c.scopes.is_empty()))
+        .collect();
+    let sites = if own.is_empty() {
+        calls.iter().filter(|c| c.scopes.contains(&line)).collect()
+    } else {
+        own
+    };
+    let first = sites.first()?;
+    let same = sites
+        .iter()
+        .all(|s| s.program.is_some() && s.program == first.program);
+    (sites.len() == 1 || same).then(|| (first.line, first.program.clone()))
+}
+
+/// The calls in a repository file that start a child process and wait for it.
+fn spawn_calls_in(root: &Path, lang: Lang, file: &str) -> Vec<SpawnCall> {
+    let inside = Path::new(file)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !inside {
+        return Vec::new(); // `/abs/bench.py`, `../bench.py`, `C:\\...`: not the repository's
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+        return Vec::new();
+    };
+    match lang {
+        Lang::Ts => js_spawn_calls(file, &text),
+        Lang::Python => python_spawn_calls(&text),
+        _ => Vec::new(),
+    }
+}
+
+/// A call that starts a child process and waits for it.
+#[derive(Debug, Clone, PartialEq)]
+struct SpawnCall {
+    /// First lines of the functions around the call, innermost last; empty at the top level.
+    scopes: Vec<u32>,
+    line: u32,
+    /// The program, when the call names it literally.
+    program: Option<String>,
+}
+
+/// The program in a command line: `sleep` in `sleep 0.2`. `interpolated` when the text goes on
+/// with a computed part (`ls ${dir}` gives `ls`, `${bin} run` and `git${x}` give nothing).
+/// Leading `NAME=value` words are the child's environment, not the program, and are never shown.
+fn first_word(command: &str, interpolated: bool) -> Option<String> {
+    let mut rest = command.trim_start();
+    loop {
+        let word = rest.split_whitespace().next()?;
+        let assignment = word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        let after = rest[word.len()..].trim_start();
+        if assignment {
+            if word.contains(['"', '\'']) {
+                return None; // `TOKEN='a b' deploy`: where the value ends is the shell's business
+            }
+            rest = after;
+            continue;
+        }
+        // The word must end before any computed part, and be safe in a markdown table.
+        let complete = !interpolated || rest.len() > word.len();
+        let plain = !word.contains(['|', '`', '$', '{']) && !word.chars().any(char::is_control);
+        return (complete && plain).then(|| word.to_string());
+    }
+}
+
+/// Node's blocking `child_process` calls in a JS/TS file, read with oxc.
+fn js_spawn_calls(path: &str, source: &str) -> Vec<SpawnCall> {
+    use oxc_ast::ast::{Argument, ArrowFunctionExpression, CallExpression, Expression, Function};
+    use oxc_ast_visit::{Visit, walk};
+    use oxc_syntax::scope::ScopeFlags;
+
+    struct Calls {
+        /// Byte offset of every newline, to turn offsets into lines without rescanning.
+        newlines: Vec<usize>,
+        scopes: Vec<u32>,
+        out: Vec<SpawnCall>,
+    }
+    impl Calls {
+        fn line(&self, offset: u32) -> u32 {
+            let before = self.newlines.partition_point(|&n| n < offset as usize);
+            u32::try_from(before + 1).unwrap_or(u32::MAX)
+        }
+    }
+    impl<'a> Visit<'a> for Calls {
+        fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+            self.scopes.push(self.line(it.span.start));
+            walk::walk_function(self, it, flags);
+            self.scopes.pop();
+        }
+        fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+            self.scopes.push(self.line(it.span.start));
+            walk::walk_arrow_function_expression(self, it);
+            self.scopes.pop();
+        }
+        fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+            let callee = match &it.callee {
+                Expression::Identifier(id) => Some(id.name.as_str()),
+                Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+                _ => None,
+            };
+            if callee.is_some_and(|n| NODE_SPAWNS.contains(&n)) {
+                let program = match it.arguments.first() {
+                    Some(Argument::StringLiteral(s)) => {
+                        first_word(&s.value.display().to_string(), false)
+                    }
+                    Some(Argument::TemplateLiteral(t)) => t.quasis.first().and_then(|q| {
+                        let text = q
+                            .value
+                            .cooked
+                            .as_ref()
+                            .map_or_else(|| q.value.raw.to_string(), |c| c.display().to_string());
+                        first_word(&text, !t.expressions.is_empty())
+                    }),
+                    _ => None,
+                };
+                self.out.push(SpawnCall {
+                    scopes: self.scopes.clone(),
+                    line: self.line(it.span.start),
+                    program,
+                });
+            }
+            walk::walk_call_expression(self, it);
+        }
+    }
+    let source_type =
+        oxc_span::SourceType::from_path(path).unwrap_or_else(|_| oxc_span::SourceType::ts());
+    let allocator = oxc_allocator::Allocator::default();
+    let ret = oxc_parser::Parser::new(&allocator, source, source_type).parse();
+    let mut calls = Calls {
+        newlines: source.match_indices('\n').map(|(i, _)| i).collect(),
+        scopes: Vec::new(),
+        out: Vec::new(),
+    };
+    calls.visit_program(&ret.program);
+    calls.out
+}
+
+/// Python's `subprocess` and `os.system` calls in a file, read with tree-sitter: through the
+/// module under any name (`import subprocess as sp`), or a function imported from it.
+fn python_spawn_calls(source: &str) -> Vec<SpawnCall> {
+    use crate::lang::syntax;
+    const SUBPROCESS: [&str; 7] = [
+        "run",
+        "call",
+        "check_call",
+        "check_output",
+        "getoutput",
+        "getstatusoutput",
+        "Popen",
+    ];
+    let spawns = |module: &str, name: &str| {
+        (module == "subprocess" && SUBPROCESS.contains(&name))
+            || (module == "os" && name == "system")
+    };
+    let Some(tree) = syntax::parse(&tree_sitter_python::LANGUAGE.into(), source) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let field = |n: tree_sitter::Node, f: &str| {
+        n.child_by_field_name(f)
+            .map_or("", |c| syntax::text(c, source))
+    };
+    let name_and_alias = |c: tree_sitter::Node| match c.kind() {
+        "aliased_import" => (field(c, "name"), field(c, "alias")),
+        _ => (syntax::text(c, source), syntax::text(c, source)),
+    };
+    let mut modules: HashMap<&str, &str> = HashMap::new();
+    let mut imported: HashSet<&str> = HashSet::new();
+    syntax::walk(root, |n| match n.kind() {
+        "import_statement" => {
+            for c in syntax::named_children(n) {
+                let (module, alias) = name_and_alias(c);
+                if matches!(module, "subprocess" | "os") {
+                    modules.insert(alias, module);
+                }
+            }
+        }
+        "import_from_statement" => {
+            let module = field(n, "module_name");
+            let mut cursor = n.walk();
+            for c in n.children_by_field_name("name", &mut cursor) {
+                let (name, alias) = name_and_alias(c);
+                if spawns(module, name) {
+                    imported.insert(alias);
+                }
+            }
+        }
+        _ => {}
+    });
+    let mut out = Vec::new();
+    syntax::walk(root, |n| {
+        if n.kind() != "call" {
+            return;
+        }
+        let Some(callee) = n.child_by_field_name("function") else {
+            return;
+        };
+        let starts = match callee.kind() {
+            "identifier" => imported.contains(syntax::text(callee, source)),
+            "attribute" => modules
+                .get(field(callee, "object"))
+                .is_some_and(|m| spawns(m, field(callee, "attribute"))),
+            _ => false,
+        };
+        if !starts {
+            return;
+        }
+        // The functions around the call, by the line cProfile gives them: a decorated function
+        // starts at its first decorator.
+        let mut scopes = Vec::new();
+        let mut up = n.parent();
+        while let Some(p) = up {
+            if matches!(
+                p.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            ) {
+                let start = p
+                    .parent()
+                    .filter(|d| d.kind() == "decorated_definition")
+                    .unwrap_or(p);
+                scopes.push(syntax::line(start));
+            }
+            up = p.parent();
+        }
+        scopes.reverse();
+        let program = n
+            .child_by_field_name("arguments")
+            .and_then(|args| {
+                let all = syntax::named_children(args);
+                all.iter()
+                    .find(|a| a.kind() == "keyword_argument" && field(**a, "name") == "args")
+                    .and_then(|a| a.child_by_field_name("value"))
+                    .or_else(|| {
+                        all.first()
+                            .copied()
+                            .filter(|a| a.kind() != "keyword_argument")
+                    })
+            })
+            .and_then(|a| python_program(a, source));
+        out.push(SpawnCall {
+            scopes,
+            line: syntax::line(n),
+            program,
+        });
+    });
+    out
+}
+
+/// The program a Python argument names: `"sleep 0.2"`, `["git", "log"]`, `("make",)`.
+fn python_program(arg: tree_sitter::Node, source: &str) -> Option<String> {
+    use crate::lang::syntax;
+    match arg.kind() {
+        "list" | "tuple" => python_program(*syntax::named_children(arg).first()?, source),
+        "string" => {
+            let parts = syntax::named_children(arg);
+            let content: String = parts
+                .iter()
+                .take_while(|p| p.kind() != "interpolation")
+                .filter(|p| p.kind() == "string_content")
+                .map(|p| syntax::text(*p, source))
+                .collect();
+            first_word(&content, parts.iter().any(|p| p.kind() == "interpolation"))
+        }
+        _ => None,
     }
 }
 
@@ -1294,6 +1943,26 @@ pub fn markdown(r: &Report) -> String {
                 .as_deref()
                 .map_or_else(|| "-".into(), |u| format!("`{u}`"))
         );
+    }
+    if let Some(summary) = r.child_summary() {
+        let _ = write!(out, "\n## Child processes\n\n{summary} {CHILD_ADVICE}\n");
+        if !r.child_processes.is_empty() {
+            out.push_str("\n| Command | Called from | Time |\n| --- | --- | ---: |\n");
+        }
+        for c in &r.child_processes {
+            let _ = writeln!(
+                out,
+                "| {} | `{}` (`{}:{}`) | {:.0}% ({:.0} ms) |",
+                c.command
+                    .as_deref()
+                    .map_or_else(|| "-".into(), |c| format!("`{c}`")),
+                c.function,
+                c.file,
+                c.line,
+                c.share,
+                c.ms
+            );
+        }
     }
     if !r.compiled.is_empty() {
         out.push_str(
@@ -1360,6 +2029,7 @@ mod tests {
             js_only: None,
             params: vec!["x".into()],
             batch: None,
+            child_pct: None,
         };
         let own = compiled_advice(&root, &hot("step", 3), &compiled).unwrap();
         assert!(
@@ -1643,6 +2313,503 @@ mod tests {
         );
         assert_eq!(functions[&key("matched", 9)].total_ms, 10.0);
         assert!(functions.contains_key(&key("(anonymous):10", 10)));
+    }
+
+    #[test]
+    fn cpuprofile_blocking_child_processes_go_to_the_caller() {
+        let f = "file:///repo/lib.js";
+        let cp = "node:child_process";
+        // main -> runAll -> execSync -> spawnSync (6 ms waiting); main -> crunch (3 ms);
+        // main -> spawn (async: starting it is all the profile sees).
+        let profile = json!({
+            "startTime": 0, "endTime": 10_000, "samples": vec![0; 10],
+            "nodes": [
+                node(1, "(root)", "", 0, 0, &[2]),
+                node(2, "main", f, 1, 0, &[3, 6, 7]),
+                node(3, "runAll", f, 3, 0, &[4]),
+                // runAll's `xs.map((x) => execSync(...))`: the wait is runAll's, as callers are.
+                node(4, "", f, 4, 0, &[8]),
+                node(8, "execSync", cp, 945, 0, &[5]),
+                node(5, "spawnSync", cp, 823, 6, &[]),
+                node(6, "crunch", f, 11, 3, &[]),
+                node(7, "spawn", cp, 700, 1, &[]),
+            ],
+        });
+        let mut functions = HashMap::new();
+        merge_cpuprofile(Path::new("/repo"), &profile, &mut functions);
+        let at = |n: &str, l: u32| &functions[&("lib.js".to_string(), n.to_string(), l)];
+        assert_eq!(
+            (at("runAll", 3).spawn_ms, at("runAll", 3).waits_ms),
+            (6.0, 6.0)
+        );
+        assert_eq!((at("main", 1).spawn_ms, at("main", 1).waits_ms), (0.0, 6.0));
+        assert_eq!(
+            at("main", 1).total_ms,
+            10.0,
+            "the wait is still the caller's time"
+        );
+        assert_eq!(
+            (at("crunch", 11).spawn_ms, at("crunch", 11).waits_ms),
+            (0.0, 0.0)
+        );
+        let callback = at("(anonymous):4", 4);
+        assert_eq!((callback.spawn_ms, callback.waits_ms), (0.0, 6.0));
+    }
+
+    #[test]
+    fn python_waits_on_subprocess_go_to_the_repository_caller() {
+        let root = Path::new("/repo");
+        let sp = "/usr/lib64/python3.12/subprocess.py";
+        let lib = "/repo/.venv/lib/python3.12/site-packages/gitlib/cmd.py";
+        let entry = |file: &str, name: &str, line: u64, total: f64, callers: Value| {
+            json!({"file": file, "line": line, "name": name, "calls": 1, "self": 0.0,
+                   "total": total, "callers": callers})
+        };
+        let caller = |file: &str, name: &str, line: u64, total: f64| json!({"file": file, "line": line, "name": name, "calls": 1, "total": total});
+        let (bench, tool) = ("/repo/bench.py", "/repo/tool.py");
+        let entries = [
+            entry(bench, "<module>", 1, 200.0, json!([])),
+            entry(
+                tool,
+                "run_all",
+                5,
+                90.0,
+                json!([caller(bench, "<module>", 1, 90.0)]),
+            ),
+            entry(
+                tool,
+                "shell_all",
+                12,
+                10.0,
+                json!([caller(bench, "<module>", 1, 10.0)]),
+            ),
+            entry(
+                sp,
+                "run",
+                464,
+                85.0,
+                json!([caller(tool, "run_all", 5, 85.0)]),
+            ),
+            // Called from `subprocess.run`, not from user code: counted once, through `run`.
+            entry(
+                sp,
+                "communicate",
+                1090,
+                84.0,
+                json!([caller(sp, "run", 464, 84.0)]),
+            ),
+            entry(
+                "~",
+                "<built-in method posix.system>",
+                0,
+                9.0,
+                json!([caller(tool, "shell_all", 12, 9.0)]),
+            ),
+            // Mutual recursion, a wait at the bottom: the wait is not fed around the cycle.
+            entry(
+                tool,
+                "even",
+                20,
+                40.0,
+                json!([
+                    caller(bench, "<module>", 1, 40.0),
+                    caller(tool, "odd", 25, 40.0)
+                ]),
+            ),
+            entry(
+                tool,
+                "odd",
+                25,
+                40.0,
+                json!([caller(tool, "even", 20, 40.0)]),
+            ),
+            entry(
+                sp,
+                "check_output",
+                400,
+                2.0,
+                json!([caller(tool, "even", 20, 2.0)]),
+            ),
+            // A library between user code and the wait: `fetch` -> `gitlib.execute` ->
+            // `with Popen(...)`, which waits in `__exit__`.
+            entry(
+                tool,
+                "fetch",
+                30,
+                30.0,
+                json!([caller(bench, "<module>", 1, 30.0)]),
+            ),
+            entry(
+                lib,
+                "execute",
+                10,
+                30.0,
+                json!([caller(tool, "fetch", 30, 30.0)]),
+            ),
+            entry(
+                sp,
+                "__exit__",
+                1100,
+                25.0,
+                json!([caller(lib, "execute", 10, 25.0)]),
+            ),
+            // A user function recursing through a library (`ast.NodeVisitor`): its wait is its
+            // own, once.
+            entry(
+                tool,
+                "visit_Call",
+                40,
+                12.0,
+                json!([
+                    caller(bench, "<module>", 1, 12.0),
+                    caller("/usr/lib64/python3.12/ast.py", "visit", 410, 12.0)
+                ]),
+            ),
+            entry(
+                "/usr/lib64/python3.12/ast.py",
+                "visit",
+                410,
+                12.0,
+                json!([caller(
+                    "/usr/lib64/python3.12/ast.py",
+                    "generic_visit",
+                    420,
+                    12.0
+                )]),
+            ),
+            entry(
+                "/usr/lib64/python3.12/ast.py",
+                "generic_visit",
+                420,
+                12.0,
+                json!([caller(tool, "visit_Call", 40, 12.0)]),
+            ),
+            entry(
+                sp,
+                "run",
+                464,
+                10.0,
+                json!([caller(tool, "visit_Call", 40, 10.0)]),
+            ),
+            // A repository module that happens to be called `subprocess.py` is user code.
+            entry(
+                "/repo/pkg/subprocess.py",
+                "run",
+                3,
+                20.0,
+                json!([caller(bench, "<module>", 1, 20.0)]),
+            ),
+        ];
+        let functions = ingest_entries(root, &entries);
+        let at = |file: &str, n: &str, l: u32| {
+            let a = &functions[&(file.to_string(), n.to_string(), l)];
+            (a.spawn_ms, a.waits_ms)
+        };
+        assert_eq!(at("tool.py", "run_all", 5), (85.0, 85.0));
+        assert_eq!(at("tool.py", "shell_all", 12), (9.0, 9.0));
+        assert_eq!(at("tool.py", "even", 20), (2.0, 2.0));
+        assert_eq!(at("tool.py", "odd", 25), (0.0, 2.0));
+        assert_eq!(at("tool.py", "fetch", 30), (25.0, 25.0));
+        assert_eq!(at("tool.py", "visit_Call", 40), (10.0, 10.0));
+        assert_eq!(
+            at("bench.py", "<module>", 1),
+            (0.0, 85.0 + 9.0 + 2.0 + 25.0 + 10.0)
+        );
+        assert_eq!(at("pkg/subprocess.py", "run", 3), (0.0, 0.0));
+        assert_eq!(
+            functions[&("pkg/subprocess.py".into(), "run".into(), 3)].total_ms,
+            20.0
+        );
+        assert!(
+            !functions
+                .keys()
+                .any(|k| k.0.ends_with("cmd.py") || k.0.contains("lib64")),
+            "{:?}",
+            functions.keys()
+        );
+        // Each wait is started by one user function, so the parts add up.
+        let started: f64 = functions.values().map(|a| a.spawn_ms).sum();
+        assert_eq!(started, 85.0 + 9.0 + 2.0 + 25.0 + 10.0);
+    }
+
+    #[test]
+    fn time_waiting_on_child_processes_is_reported_and_not_offered_for_porting() {
+        let root =
+            std::env::temp_dir().join(format!("rust-anything-children-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"demo","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib.js"),
+            "import { execSync } from \"node:child_process\";\n\n\
+             export function runAll(n) {\n  let out = 0;\n  for (let i = 0; i < n; i++) {\n    \
+             out += execSync(\"sleep 0.2\").length;\n  }\n  return out;\n}\n\n\
+             export function crunch(n) {\n  let s = 0;\n  for (let i = 0; i < n; i++) s = (s + i * i) % 1000003;\n  return s;\n}\n",
+        )
+        .unwrap();
+        let build = |wait: f64, cpu: f64| {
+            let functions: HashMap<Key, Acc> = [
+                (
+                    ("lib.js".to_string(), "runAll".to_string(), 3),
+                    Acc {
+                        total_ms: wait,
+                        spawn_ms: wait,
+                        waits_ms: wait,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    ("lib.js".to_string(), "crunch".to_string(), 11),
+                    Acc {
+                        self_ms: cpu,
+                        total_ms: cpu,
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect();
+            report(
+                &root,
+                Lang::Ts,
+                &["node".into(), "bench.mjs".into()],
+                functions,
+                100.0,
+            )
+        };
+        let r = build(40.0, 55.0);
+        let r_spawns = build(60.0, 30.0);
+        let quiet = build(0.0, 90.0);
+        assert_eq!(
+            (r.child_pct, r_spawns.child_pct, quiet.child_pct),
+            (40.0, 60.0, 0.0)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let c = &r.child_processes[0];
+        assert_eq!(
+            (
+                c.command.as_deref(),
+                c.file.as_str(),
+                c.line,
+                c.function.as_str(),
+                c.share
+            ),
+            (Some("sleep"), "lib.js", 6, "runAll", 40.0)
+        );
+        let run_all = r.hot.iter().find(|h| h.name == "runAll").unwrap();
+        assert_eq!(run_all.child_pct, Some(100.0));
+        assert!(run_all.advice.contains(CHILD_ADVICE), "{}", run_all.advice);
+        assert_eq!(
+            r.hot.iter().find(|h| h.name == "crunch").unwrap().child_pct,
+            None
+        );
+        let md = markdown(&r);
+        assert!(
+            md.contains("## Child processes\n\n40% of the run waits on child processes (`sleep` from `lib.js:6`). Porting code will not speed this up"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| `sleep` | `runAll` (`lib.js:6`) | 40% (40 ms) |"),
+            "{md}"
+        );
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["child_processes"][0]["command"], "sleep");
+        // `go` passes over the waiting function; named, it says why.
+        assert_eq!(crate::go::pick(&r, None).unwrap().function, "crunch");
+        let named = crate::go::pick(&r, Some("runAll")).unwrap_err().to_string();
+        assert!(
+            named.contains("100% of its time waiting on child processes"),
+            "{named}"
+        );
+        // When child processes take most of the run, `go` stops unless a function is named.
+        let stop = crate::go::pick(&r_spawns, None).unwrap_err().to_string();
+        assert!(
+            stop.starts_with("60% of the run waits on child processes"),
+            "{stop}"
+        );
+        assert!(stop.contains("--function"), "{stop}");
+        assert_eq!(
+            crate::go::pick(&r_spawns, Some("crunch")).unwrap().function,
+            "crunch"
+        );
+        // Nothing waits: no section, no field.
+        assert!(quiet.child_processes.is_empty());
+        assert!(!markdown(&quiet).contains("Child processes"));
+        assert!(
+            serde_json::to_value(&quiet)
+                .unwrap()
+                .get("child_processes")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&quiet)
+                .unwrap()
+                .get("child_pct")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&quiet).unwrap()["hot"][0]
+                .get("child_pct")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_program_in_a_command_line() {
+        assert_eq!(first_word("sleep 0.2", false).as_deref(), Some("sleep"));
+        assert_eq!(
+            first_word("TOKEN=abc LANG=C deploy --now", false).as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(
+            first_word("TOKEN=abc", false),
+            None,
+            "never shows an assignment"
+        );
+        assert_eq!(first_word("TOKEN='abc def' deploy", false), None);
+        assert_eq!(first_word("ls ", true).as_deref(), Some("ls"));
+        assert_eq!(
+            first_word("git", true),
+            None,
+            "`git${{x}}`: the program is computed"
+        );
+        assert_eq!(first_word("a|b c", false), None);
+        assert_eq!(first_word("$HOME/bin/x run", false), None);
+    }
+
+    #[test]
+    fn javascript_spawn_calls_and_their_programs() {
+        let src = "import { execSync, execFileSync } from \"node:child_process\";\n\
+                   import * as cp from \"node:child_process\";\n\
+                   execSync(\"make\");\n\
+                   export function runAll(xs) {\n\
+                   \x20 // old: execSync(\"echo hi\")\n\
+                   \x20 const sep = '}';\n\
+                   \x20 return xs.map((x) =>\n\
+                   \x20   execSync(`sleep ${x}`).length);\n\
+                   }\n\
+                   export function both() { return execSync(\"git status\") + cp.execSync(\"npm test\"); }\n\
+                   export function many(\n\
+                   \x20 opts: { cwd: string },\n\
+                   ): void {\n\
+                   \x20 execFileSync(\n\
+                   \x20   \"ffmpeg\",\n\
+                   \x20   [\"-i\", opts.cwd],\n\
+                   \x20 );\n\
+                   \x20 cp.spawnSync(`${opts.cwd}/bin`, []);\n\
+                   }\n";
+        let calls = js_spawn_calls("lib.ts", src);
+        let summary: Vec<(Vec<u32>, u32, Option<&str>)> = calls
+            .iter()
+            .map(|c| (c.scopes.clone(), c.line, c.program.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (vec![], 3, Some("make")),
+                (vec![4, 7], 8, Some("sleep")),
+                (vec![10], 10, Some("git")),
+                (vec![10], 10, Some("npm")),
+                (vec![11], 14, Some("ffmpeg")),
+                (vec![11], 18, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_spawn_calls_and_their_programs() {
+        let src = "import os\nimport subprocess as sp\nfrom subprocess import check_output as co\n\n\
+                   sp.run([\"make\"])\n\n\
+                   def run_all(\n    n: int,\n) -> None:\n    \"\"\"e.g. sp.run([\"echo\"])\"\"\"\n    \
+                   sp.run(\n        [\"git\", \"status\"],\n    )\n\n\n\
+                   @cache\ndef shell():\n    os.system(\"\"\"sleep 0.1\"\"\")\n    co(args=(\"ls\", \"-l\"))\n    \
+                   sp.check_call(f\"{tool} run\")\n    sp.Popen(f\"tar {flags}\")\n    \
+                   other.run(\"nope\")\n    run(\"not imported\")\n";
+        let calls = python_spawn_calls(src);
+        let summary: Vec<(Vec<u32>, u32, Option<&str>)> = calls
+            .iter()
+            .map(|c| (c.scopes.clone(), c.line, c.program.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (vec![], 5, Some("make")),
+                (vec![7], 11, Some("git")),
+                (vec![16], 18, Some("sleep")),
+                (vec![16], 19, Some("ls")),
+                (vec![16], 20, None),
+                (vec![16], 21, Some("tar")),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_site_of_a_functions_child_process() {
+        let root = std::env::temp_dir().join(format!("rust-anything-sites-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("tool.py"),
+            "import os, subprocess\n\nsubprocess.run([\"make\"])\n\n\
+             def same():\n    subprocess.run([\"git\", \"fetch\"])\n    subprocess.check_output([\"git\", \"log\"])\n\n\
+             def mixed(x):\n    os.system(\"make\")\n    subprocess.run(x)\n\n\
+             def other(p):\n    return p.check_output()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib.js"),
+            "import { execSync } from \"node:child_process\";\nexecSync(\"make\");\n\
+             export function runAll(xs) {\n  return xs.map((x) => execSync(`sleep ${x}`));\n}\n",
+        )
+        .unwrap();
+        let (py_calls, js_calls) = (
+            spawn_calls_in(&root, Lang::Python, "tool.py"),
+            spawn_calls_in(&root, Lang::Ts, "lib.js"),
+        );
+        let py = |name: &str, line| spawn_site(&py_calls, name, line);
+        let js = |name: &str, line| spawn_site(&js_calls, name, line);
+        assert!(spawn_calls_in(&root, Lang::Python, "/elsewhere/tool.py").is_empty());
+        assert!(spawn_calls_in(&root, Lang::Python, "../tool.py").is_empty());
+        let got = (
+            py("<module>", 1),
+            py("same", 5),
+            py("mixed", 9),
+            py("other", 13),
+            js("(anonymous):1", 1),
+            js("runAll", 3),
+            js("(anonymous):4", 4),
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            got.0,
+            Some((3, Some("make".into()))),
+            "the top level of a script"
+        );
+        assert_eq!(
+            got.1,
+            Some((6, Some("git".into()))),
+            "two calls, one program"
+        );
+        assert_eq!(
+            got.2, None,
+            "two calls, two programs: the function's line is shown"
+        );
+        assert_eq!(
+            got.3, None,
+            "`p.check_output()` is not `subprocess.check_output`"
+        );
+        assert_eq!(got.4, Some((2, Some("make".into()))));
+        assert_eq!(
+            got.5,
+            Some((4, Some("sleep".into()))),
+            "a call in a callback"
+        );
+        assert_eq!(got.6, Some((4, Some("sleep".into()))));
     }
 
     #[test]
