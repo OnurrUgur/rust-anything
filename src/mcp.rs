@@ -541,7 +541,7 @@ fn tool_schemas() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "crate": crate_dir,
                 "count": { "type": "integer", "description": "Generated cases per function (default 200)." },
-                "inputs": { "type": "string", "description": "JSONL file of extra cases: {\"fn\": name, \"args\": [...]}." },
+                "inputs": { "type": "string", "description": "JSONL file of extra cases: {\"fn\": name, \"args\": [...]}, plus \"kwargs\": {...} for Python and Ruby arguments passed by keyword." },
                 "module": { "type": "string", "description": "JS only: import the original from this JS module instead of the TS source." },
                 "resolve_from": { "type": "string", "description": "Resolve npm packages from this folder's node_modules." },
                 "float_tolerance": { "type": "number", "description": "Numeric code: floats match when they differ by at most this times the larger magnitude (absolute below 1), e.g. 1e-9. Saved with the crate for diff and gate; 0 removes it." },

@@ -59,7 +59,7 @@ Runs the original's code or commands.
 | --- | --- | --- | --- |
 | `crate` | string | yes | Folder of the generated crate (holds rust-anything.json). |
 | `count` | integer |  | Generated cases per function (default 200). |
-| `inputs` | string |  | JSONL file of extra cases: {"fn": name, "args": [...]}. |
+| `inputs` | string |  | JSONL file of extra cases: {"fn": name, "args": [...]}, plus "kwargs": {...} for Python and Ruby arguments passed by keyword. |
 | `module` | string |  | JS only: import the original from this JS module instead of the TS source. |
 | `resolve_from` | string |  | Resolve npm packages from this folder's node_modules. |
 | `float_tolerance` | number |  | Numeric code: floats match when they differ by at most this times the larger magnitude (absolute below 1), e.g. 1e-9. Saved with the crate for diff and gate; 0 removes it. |
