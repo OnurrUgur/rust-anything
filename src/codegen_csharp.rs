@@ -255,20 +255,6 @@ pub fn project(
     )
 }
 
-const BUILD_ONLY: &[&str] = &[
-    "Microsoft.SourceLink.",
-    "Microsoft.NETFramework.ReferenceAssemblies",
-    "Microsoft.CodeAnalysis.NetAnalyzers",
-    "Microsoft.CodeAnalysis.PublicApiAnalyzers",
-    "Microsoft.CodeAnalysis.BannedApiAnalyzers",
-    "StyleCop.Analyzers",
-    "Nerdbank.GitVersioning",
-    "MinVer",
-    "coverlet.",
-    "Roslynator.",
-    "SonarAnalyzer.",
-];
-
 /// The project's unconditional `<PackageReference>` tags, without build-only tooling (Source Link,
 /// reference assemblies, analyzers, versioning): references under a `Condition` target other
 /// frameworks than the driver's.
@@ -295,7 +281,7 @@ pub fn package_references(project: &str) -> Vec<String> {
                 .nth(1)
                 .and_then(|r| r.split('"').next())
                 .unwrap_or("");
-            if open.contains("Condition") || BUILD_ONLY.iter().any(|b| name.starts_with(b)) {
+            if open.contains("Condition") || crate::lang::csharp::is_build_only(name) {
                 continue;
             }
             out.push(format!("<PackageReference{tag}"));

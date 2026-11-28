@@ -37,20 +37,101 @@ const TEST_PACKAGES: &[&str] = &[
     "Microsoft.NET.Test.Sdk",
 ];
 
+/// NuGet packages that only run at build or analysis time (Source Link, reference assemblies,
+/// analyzers, versioning, coverage): not runtime dependencies.
+pub(crate) const BUILD_ONLY: &[&str] = &[
+    "Microsoft.SourceLink.",
+    "Microsoft.NETFramework.ReferenceAssemblies",
+    "Microsoft.CodeAnalysis.NetAnalyzers",
+    "Microsoft.CodeAnalysis.PublicApiAnalyzers",
+    "Microsoft.CodeAnalysis.BannedApiAnalyzers",
+    "StyleCop.Analyzers",
+    "Nerdbank.GitVersioning",
+    "MinVer",
+    "coverlet.",
+    "Roslynator.",
+    "SonarAnalyzer.",
+];
+
+pub(crate) fn is_build_only(name: &str) -> bool {
+    BUILD_ONLY.iter().any(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 // ---- discovery -------------------------------------------------------------------------------
 
 fn attribute(tag: &str, name: &str) -> Option<String> {
-    let start = tag.find(&format!("{name}=\""))? + name.len() + 2;
-    let end = tag[start..].find('"')?;
-    Some(tag[start..start + end].to_string())
+    let mut rest = tag;
+    while let Some(pos) = rest.find(name) {
+        let before_ok = pos == 0
+            || rest[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let after = &rest[pos + name.len()..];
+        if before_ok {
+            let after = after.trim_start();
+            if let Some(after) = after.strip_prefix('=') {
+                let after = after.trim_start();
+                if let Some(quote) = after.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    let inner = &after[1..];
+                    if let Some(end) = inner.find(quote) {
+                        return Some(inner[..end].to_string());
+                    }
+                }
+            }
+        }
+        rest = after;
+    }
+    None
 }
 
-/// `Include` of each `<PackageReference>` in a project file, outside `<!-- -->` comments.
-pub fn package_references(text: &str) -> Vec<String> {
+/// Every `<PackageReference Include="...">` in `text` (outside `<!-- -->` comments), paired with
+/// whether it is build-only (`BUILD_ONLY` or `PrivateAssets="all"`).
+fn all_package_references(text: &str) -> Vec<(String, bool)> {
     let text = super::syntax::without_xml_comments(text);
-    text.split("<PackageReference")
-        .skip(1)
-        .filter_map(|tag| attribute(tag.split('>').next().unwrap_or(""), "Include"))
+    let mut out = Vec::new();
+    for tag in text.split("<PackageReference").skip(1) {
+        if !tag
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/')
+        {
+            continue;
+        }
+        let Some(open_end) = tag.find('>') else {
+            continue;
+        };
+        let open = &tag[..open_end];
+        let Some(name) = attribute(open, "Include") else {
+            continue;
+        };
+        let mut build_only = is_build_only(&name)
+            || attribute(open, "PrivateAssets")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("all"));
+        if !build_only && !open.trim_end().ends_with('/') {
+            let after_open = &tag[open_end + 1..];
+            let body = after_open
+                .split("</PackageReference>")
+                .next()
+                .unwrap_or(after_open);
+            build_only = element(body, "PrivateAssets")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("all"));
+        }
+        out.push((name, build_only));
+    }
+    out
+}
+
+/// `Include` of each runtime `<PackageReference>` in a project file, outside `<!-- -->` comments.
+/// Build-only tooling packages (`BUILD_ONLY`) and references with `PrivateAssets="all"` (as an
+/// attribute or child element) are excluded.
+pub fn package_references(text: &str) -> Vec<String> {
+    all_package_references(text)
+        .into_iter()
+        .filter_map(|(name, build_only)| (!build_only).then_some(name))
         .collect()
 }
 
@@ -67,9 +148,9 @@ fn element(text: &str, tag: &str) -> Option<String> {
 /// A project of tests: it references a test framework or says `IsTestProject`.
 pub fn is_test_project(text: &str) -> bool {
     let text = super::syntax::without_xml_comments(text);
-    package_references(&text)
+    all_package_references(&text)
         .iter()
-        .any(|d| TEST_PACKAGES.iter().any(|t| d.starts_with(t)))
+        .any(|(d, _)| TEST_PACKAGES.iter().any(|t| d.starts_with(t)))
         || element(&text, "IsTestProject").as_deref() == Some("true")
 }
 
@@ -978,5 +1059,34 @@ mod tests {
             <PackageReference Include="Serilog" Version="4.0.0"></PackageReference>
             </ItemGroup></Project>"#;
         assert_eq!(package_references(proj), ["Newtonsoft.Json", "Serilog"]);
+    }
+
+    #[test]
+    fn excludes_build_only_and_private_assets_all_packages() {
+        let proj = r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+            <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+            <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" />
+            <PackageReference Include="StyleCop.Analyzers" Version="1.2.0" />
+            <PackageReference Include="coverlet.collector" Version="6.0.0" />
+            <PackageReference Include="SomeGenerator" Version="1.0.0" PrivateAssets="all" />
+            <PackageReference Include="AnotherGen" Version="1.0.0" PrivateAssets='ALL' />
+            <PackageReference Include="Serilog" Version="4.0.0" />
+            <PackageReference Include="PolySharp" Version="1.14.1">
+              <PrivateAssets> All </PrivateAssets>
+              <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+            </PackageReference>
+            <PackageReference Include="PartialPrivate" Version="1.0.0" PrivateAssets="analyzers" />
+            </ItemGroup></Project>"#;
+        assert_eq!(
+            package_references(proj),
+            ["Newtonsoft.Json", "Serilog", "PartialPrivate"]
+        );
+        // Test-project detection still inspects unfiltered references (e.g. a runner with
+        // PrivateAssets="all" when xunit itself comes from Directory.Build.props).
+        let test_proj = r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+            <PackageReference Include="xunit.runner.visualstudio" Version="2.8.0" PrivateAssets="all" />
+            </ItemGroup></Project>"#;
+        assert!(is_test_project(test_proj));
+        assert!(package_references(test_proj).is_empty());
     }
 }
