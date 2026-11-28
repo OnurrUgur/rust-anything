@@ -307,6 +307,18 @@ pub(crate) fn generate_cases_salted(
                     manifest.language.name()
                 );
             }
+            if !matches!(&case["kwargs"], Value::Null | Value::Object(_)) {
+                bail!(
+                    "{}:{}: \"kwargs\" must be an object of argument names to values",
+                    path.display(),
+                    i + 1
+                );
+            }
+            if matches!(case.get("kwargs"), Some(Value::Null))
+                && let Some(obj) = case.as_object_mut()
+            {
+                obj.remove("kwargs");
+            }
             case["module"] = Value::String(module_for(&f.file)?);
             cases.push(case);
         }

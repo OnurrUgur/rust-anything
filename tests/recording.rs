@@ -834,3 +834,156 @@ fn from_tests_singular_one_call() {
         "{printed}"
     );
 }
+
+#[test]
+fn record_inputs_rejects_non_object_kwargs_on_python_and_ruby() {
+    let dir = std::env::temp_dir().join(format!(
+        "rust-anything-inputs-kwargs-bad-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("scale.py"),
+        "def scale(n: float, *, by: float = 2.0) -> float:\n    return n * by\n",
+    )
+    .unwrap();
+    let py_manifest = serde_json::json!({
+        "schema": "rust-anything/bridge@1",
+        "root": ".",
+        "unit": "scale.py",
+        "language": "python",
+        "kind": "pyo3",
+        "crate_name": "scale-rs",
+        "exports": [
+            {
+                "name": "scale",
+                "file": "scale.py",
+                "line": 1,
+                "params": [
+                    {"name": "n", "ts_type": "number", "optional": false, "rest": false},
+                    {"name": "by", "ts_type": "number", "optional": true, "rest": false, "keyword_only": true}
+                ],
+                "returns": "number",
+                "is_async": false,
+                "is_generator": false,
+                "type_params": [],
+                "uses_instanceof": false
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join(rust_anything::bridge::MANIFEST),
+        py_manifest.to_string(),
+    )
+    .unwrap();
+
+    for (file, line) in [
+        (
+            "str.jsonl",
+            "{\"fn\":\"scale\",\"args\":[3],\"kwargs\":\"by\"}\n",
+        ),
+        (
+            "arr.jsonl",
+            "{\"fn\":\"scale\",\"args\":[3],\"kwargs\":[10]}\n",
+        ),
+        (
+            "num.jsonl",
+            "{\"fn\":\"scale\",\"args\":[3],\"kwargs\":10}\n",
+        ),
+        (
+            "bool.jsonl",
+            "{\"fn\":\"scale\",\"args\":[3],\"kwargs\":true}\n",
+        ),
+    ] {
+        let in_file = dir.join(file);
+        std::fs::write(&in_file, line).unwrap();
+        let err = rust_anything::harness::record(&rust_anything::harness::RecordOptions {
+            crate_dir: &dir,
+            count: 0,
+            inputs: Some(&in_file),
+            module: None,
+            resolve_from: None,
+            node_args: &[],
+            sandbox: false,
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}:1: \"kwargs\" must be an object of argument names to values",
+                in_file.display()
+            )
+        );
+    }
+
+    if common::have("python3") {
+        let ok_file = dir.join("ok.jsonl");
+        std::fs::write(
+            &ok_file,
+            "{\"fn\":\"scale\",\"args\":[3],\"kwargs\":{\"by\":10}}\n\
+             {\"fn\":\"scale\",\"args\":[3],\"kwargs\":{}}\n\
+             {\"fn\":\"scale\",\"args\":[3],\"kwargs\":null}\n",
+        )
+        .unwrap();
+        let outcome = rust_anything::harness::record(&rust_anything::harness::RecordOptions {
+            crate_dir: &dir,
+            count: 0,
+            inputs: Some(&ok_file),
+            module: None,
+            resolve_from: None,
+            node_args: &[],
+            sandbox: false,
+        })
+        .unwrap();
+        assert_eq!(outcome.cases, 3);
+    }
+
+    let rb_manifest = serde_json::json!({
+        "schema": "rust-anything/bridge@1",
+        "root": ".",
+        "unit": "scale.rb",
+        "language": "ruby",
+        "kind": "ffi",
+        "crate_name": "scale-rs",
+        "exports": [
+            {
+                "name": "scale",
+                "file": "scale.rb",
+                "line": 1,
+                "params": [],
+                "returns": "number",
+                "is_async": false,
+                "is_generator": false,
+                "type_params": [],
+                "uses_instanceof": false
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join(rust_anything::bridge::MANIFEST),
+        rb_manifest.to_string(),
+    )
+    .unwrap();
+    let rb_in = dir.join("rb_bad.jsonl");
+    std::fs::write(&rb_in, "{\"fn\":\"scale\",\"args\":[3],\"kwargs\":[1]}\n").unwrap();
+    let err = rust_anything::harness::record(&rust_anything::harness::RecordOptions {
+        crate_dir: &dir,
+        count: 0,
+        inputs: Some(&rb_in),
+        module: None,
+        resolve_from: None,
+        node_args: &[],
+        sandbox: false,
+    })
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{}:1: \"kwargs\" must be an object of argument names to values",
+            rb_in.display()
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
