@@ -363,7 +363,7 @@ fn line_holds(line: &str, value: &str) -> bool {
 
 /// The environment variables with a secret-looking name whose value appears in the recorded
 /// `cases`, each with the functions whose cases hold it. Only names come back, never values.
-fn recorded_secrets(
+pub(crate) fn recorded_secrets(
     cases: &str,
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, Vec<String>)> {
@@ -379,7 +379,12 @@ fn recorded_secrets(
         for line in cases.lines().filter(|line| line_holds(line, &value)) {
             let function = serde_json::from_str::<Value>(line)
                 .ok()
-                .and_then(|case| case["fn"].as_str().map(str::to_string))
+                .and_then(|case| {
+                    case["fn"]
+                        .as_str()
+                        .or_else(|| case["class"].as_str())
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| "?".to_string());
             if !functions.contains(&function) {
                 functions.push(function);
@@ -391,6 +396,12 @@ fn recorded_secrets(
     }
     found.sort();
     found
+}
+
+/// Environment variables whose name and value are valid Unicode.
+pub(crate) fn unicode_env() -> impl Iterator<Item = (String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
 }
 
 /// Takes the recording away: removed, or, when the folder does not let it be removed, emptied.
@@ -409,9 +420,7 @@ fn refuse_recorded_secrets(cases_path: &Path) -> Result<()> {
     let Ok(cases) = std::fs::read_to_string(cases_path) else {
         return Ok(());
     };
-    let environment = std::env::vars_os()
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
-    let found = recorded_secrets(&cases, environment);
+    let found = recorded_secrets(&cases, unicode_env());
     if found.is_empty() {
         return Ok(());
     }

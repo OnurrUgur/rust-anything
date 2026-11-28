@@ -252,15 +252,42 @@ pub fn fuzz(opts: &FuzzOptions) -> Result<FuzzOutcome> {
         }
     }
     let _ = std::fs::remove_dir_all(crate_dir.join(WORK_DIR).join("coverage"));
-    if !keep.is_empty() {
-        let mut text = original;
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&keep);
-        std::fs::write(&recording, text)?;
-    }
+    append_kept(&recording, original, &keep, harness::unicode_env())?;
     Ok(outcome)
+}
+
+/// Appends kept fuzz cases to `recording`, refusing before writing if any kept case holds the
+/// value of a secret-looking environment variable. Existing cases in `recording` stay untouched.
+fn append_kept(
+    recording: &Path,
+    original: String,
+    keep: &str,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Result<()> {
+    if keep.is_empty() {
+        return Ok(());
+    }
+    let found = harness::recorded_secrets(keep, environment);
+    if !found.is_empty() {
+        let listed: Vec<String> = found
+            .iter()
+            .map(|(name, functions)| format!("{name} (in {})", functions.join(", ")))
+            .collect();
+        bail!(
+            "the kept cases held the value of {}, and {} is meant to be committed: nothing was \
+             appended. Run `fuzz` without those variables (`env -u NAME rust-anything fuzz ...`), \
+             or change the functions or inputs that return them",
+            listed.join("; "),
+            CASES,
+        );
+    }
+    let mut text = original;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(keep);
+    std::fs::write(recording, text)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,6 +335,50 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "old");
         assert!(!fresh.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_kept_refuses_secrets_and_leaves_existing_recording_untouched() {
+        let dir =
+            std::env::temp_dir().join(format!("rust-anything-fuzz-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recording = dir.join(CASES);
+        let original = "{\"fn\":\"ok\",\"args\":[1],\"ok\":2}\n";
+        std::fs::write(&recording, original).unwrap();
+
+        let canary = "example-secret-canary";
+        let kept = format!(
+            "{{\"fn\":\"leak\",\"args\":[],\"ok\":\"{canary}\"}}\n\
+             {{\"class\":\"Vault\",\"ctor\":[],\"calls\":[],\"results\":[\"{canary}\"]}}\n"
+        );
+        let env = vec![("MY_API_TOKEN".to_string(), canary.to_string())];
+        let err = append_kept(&recording, original.to_string(), &kept, env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MY_API_TOKEN"), "{err}");
+        assert!(err.contains("leak"), "{err}");
+        assert!(err.contains("Vault"), "{err}");
+        assert!(
+            !err.contains(canary),
+            "secret value must never appear: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&recording).unwrap(), original);
+
+        let clean = "{\"fn\":\"add\",\"args\":[1,2],\"ok\":3}\n";
+        append_kept(
+            &recording,
+            original.trim_end().to_string(),
+            clean,
+            vec![("MY_API_TOKEN".to_string(), canary.to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&recording).unwrap(),
+            format!("{original}{clean}")
+        );
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
