@@ -44,6 +44,7 @@ pub struct Port {
     pub in_rust: Vec<String>,
     pub kept_in_original: Vec<String>,
     pub cases: usize,
+    pub recorded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_diff: Option<(usize, usize)>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +250,7 @@ fn port(root: &Path, dir: &Path, m: &Manifest, log: &[crate::audit::Entry]) -> P
         in_rust,
         kept_in_original,
         cases,
+        recorded: dir.join(recording::RECORDED_FROM).is_file(),
         last_diff: recording::last_diff(dir),
         changed_upstream: recording::stale(dir, m),
     }
@@ -328,6 +330,7 @@ fn render(out: &mut String, map: &PortMap) -> std::fmt::Result {
     )?;
     match map.changed() {
         _ if map.ports.is_empty() => writeln!(out, ".\n")?,
+        0 if !map.ports.iter().any(|p| p.recorded) => writeln!(out, "; none recorded yet.\n")?,
         0 => writeln!(out, "; no original changed since it was recorded.\n")?,
         1 => writeln!(
             out,
@@ -371,7 +374,9 @@ fn render(out: &mut String, map: &PortMap) -> std::fmt::Result {
                 p.cases,
                 p.last_diff
                     .map_or("not run".into(), |(m, t)| format!("{m}/{t}")),
-                if p.changed_upstream.is_some() {
+                if !p.recorded {
+                    "not recorded".into()
+                } else if p.changed_upstream.is_some() {
                     format!("**changed**: `rust-anything record {}`", p.crate_dir)
                 } else {
                     "unchanged".into()
