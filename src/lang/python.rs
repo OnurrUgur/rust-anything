@@ -149,6 +149,9 @@ fn read_package(root: &Path, dir: &str) -> Package {
             );
         }
     }
+    if let Ok(text) = std::fs::read_to_string(root.join(join("setup.cfg"))) {
+        deps.extend(setup_cfg_requirements(&text));
+    }
     requirements_from(
         &root.join(join("requirements.txt")),
         &mut deps,
@@ -194,6 +197,51 @@ fn requirement_name(spec: &str) -> Option<String> {
     let carried = rest.is_empty()
         || rest.starts_with(['[', '(', '=', '<', '>', '!', '~', ';', ',', '@', '#']);
     carried.then(|| normalized_name(&name))
+}
+
+/// `install_requires` under `[options]` in a `setup.cfg`: a single value on the `=` line,
+/// indented continuation lines, or both. Comments (`#` or `;`) and blank lines inside the block
+/// do not end it; `[options.extras_require]` and other sections are ignored.
+fn setup_cfg_requirements(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_options = false;
+    let mut in_install_requires = false;
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with(['#', ';']) {
+            continue;
+        }
+        let indented = raw.starts_with([' ', '\t']);
+        if !indented
+            && trimmed.starts_with('[')
+            && let Some(end) = trimmed.find(']')
+        {
+            in_options = trimmed[1..end].trim() == "options";
+            in_install_requires = false;
+            continue;
+        }
+        if !in_options {
+            continue;
+        }
+        if indented {
+            if in_install_requires {
+                out.extend(requirement_name(trimmed));
+            }
+            continue;
+        }
+        if let Some((key, value)) = raw.split_once(['=', ':'])
+            && key.trim() == "install_requires"
+        {
+            in_install_requires = true;
+            let value = value.trim();
+            if !value.is_empty() && !value.starts_with(['#', ';']) {
+                out.extend(requirement_name(value));
+            }
+        } else {
+            in_install_requires = false;
+        }
+    }
+    out
 }
 
 /// The packages a requirements file names, following `-r` / `--requirement` includes: a file that
@@ -1847,5 +1895,48 @@ mod tests {
         assert_eq!(to_ts_type("list[Path]"), "pypath[]");
         // A project's own class that only ends in `Path` is still a named class.
         assert_eq!(to_ts_type("DataPath"), "DataPath");
+    }
+
+    #[test]
+    fn reads_install_requires_from_setup_cfg() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-anything-python-setup-cfg-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("setup.cfg"),
+            concat!(
+                "[metadata]\n",
+                "name = demo\n\n",
+                "[options]\n",
+                "packages = find:\n",
+                "install_requires =\n",
+                "    requests>=2.28\n",
+                "    # a comment inside the list\n",
+                "    ; another comment\n\n",
+                "    PyYAML >= 6.0 ; python_version >= \"3.9\"\n",
+                "python_requires = >=3.9\n\n",
+                "[options.extras_require]\n",
+                "dev =\n",
+                "    pytest>=7\n",
+            ),
+        )
+        .unwrap();
+        let pkg = read_package(&dir, "");
+        assert_eq!(pkg.deps, ["requests", "pyyaml"]);
+
+        // Single-line value on the `=` line, and mixed same-line + continuation.
+        assert_eq!(
+            setup_cfg_requirements("[options]\ninstall_requires = httpx>=0.25\n"),
+            ["httpx"]
+        );
+        assert_eq!(
+            setup_cfg_requirements("[options]\ninstall_requires = httpx>=0.25\n    click>=8.0\n"),
+            ["httpx", "click"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
